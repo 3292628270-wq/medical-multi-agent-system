@@ -46,20 +46,10 @@ def _route_after_diagnosis(state: ClinicalState) -> str:
 def _create_checkpointer():
     """
     创建持久化 checkpointer。
-    优先使用 SqliteSaver（磁盘持久化），不可用时回退 MemorySaver（内存）。
+    当前使用 MemorySaver（兼容 sync/async 双模，支持 astream_events）。
+    TODO: 生产环境切换到 PostgresSaver 或正确初始化的 AsyncSqliteSaver。
     """
-    try:
-        import sqlite3
-        from langgraph.checkpoint.sqlite import SqliteSaver
-        _CHECKPOINT_DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-        conn = sqlite3.connect(str(_CHECKPOINT_DB_PATH), check_same_thread=False)
-        checkpointer = SqliteSaver(conn)
-        logger.info("checkpointer.sqlite_ready", path=str(_CHECKPOINT_DB_PATH))
-        return checkpointer
-    except Exception as e:
-        logger.warning("checkpointer.sqlite_unavailable", error=str(e),
-                       fallback="MemorySaver")
-        return MemorySaver()
+    return MemorySaver()
 
 
 def build_clinical_pipeline(checkpointer=None):

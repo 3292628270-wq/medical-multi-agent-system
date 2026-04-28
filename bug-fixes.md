@@ -192,6 +192,30 @@ if (agent.name === 'diagnosis' && data.diagnosis) {
 
 ---
 
+## Bug #6: SSE 流式端点崩溃 — SqliteSaver 不支持 async
+
+**现象**：调用 `POST /clinical/analyze/stream` 时报 `NotImplementedError`，SSE 端点完全不可用
+
+**错误日志**：
+```
+NotImplementedError: The SqliteSaver does not support async methods. 
+Consider using AsyncSqliteSaver instead.
+```
+
+**原因**：`pipeline.astream_events()` 是 async 方法，底层需要 checkpointer 支持 `aget_tuple()` 等异步操作。`SqliteSaver` 只实现了同步接口。`AsyncSqliteSaver.from_conn_string()` 又是 async context manager，无法在同步的 `_create_checkpointer()` 中正确初始化。
+
+**修复文件**：`src/graph/clinical_pipeline.py`
+
+**方案**：暂时回退为 `MemorySaver()`。MemorySaver 同时支持 sync/async 双模，兼容 `invoke()` 和 `astream_events()`。磁盘持久化待后需改用 `PostgresSaver` 或 `AsyncSqliteSaver`（需在 FastAPI lifespan 事件中正确初始化 async context manager）。
+
+```python
+# 修复后（临时方案）
+def _create_checkpointer():
+    return MemorySaver()
+```
+
+---
+
 ## 影响范围总结
 
 | Bug# | 严重程度 | 影响 | 修复文件数 |
@@ -201,3 +225,4 @@ if (agent.name === 'diagnosis' && data.diagnosis) {
 | #3 | P0 资源耗尽 | 无限循环消耗 API 额度 | 1 |
 | #4 | P1 数据丢失 | Agent 产出被丢弃，下游收到 None | 3 |
 | #5 | P1 不可见 | 后端正确但前端白屏 | 1 |
+| #6 | P0 SSE 崩溃 | `astream_events` 需要 async checkpointer，`SqliteSaver` 不支持 | 1 |
