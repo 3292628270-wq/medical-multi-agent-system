@@ -19,13 +19,17 @@ from ..agents.coding_agent import coding_agent
 from ..agents.audit_agent import audit_agent
 
 
+# 诊断信息不足时最多回退 Intake 的次数
+MAX_DIAGNOSIS_RETRIES = 3
+
+
 def _route_after_diagnosis(state: ClinicalState) -> str:
     """
-    Conditional edge after Diagnosis Agent.
-    If the agent determines more patient info is needed, route back to Intake.
-    Otherwise proceed to Treatment.
+    Diagnosis Agent 之后的条件路由。
+    如果信息不足且在重试上限内，回退到 Intake 重新收集信息。
+    超过上限后强制进入 Treatment。
     """
-    if state.needs_more_info:
+    if state.needs_more_info and state.diagnosis_retry_count < MAX_DIAGNOSIS_RETRIES:
         return "intake"
     return "treatment"
 
