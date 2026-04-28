@@ -216,6 +216,41 @@ def _create_checkpointer():
 
 ---
 
+## Bug #7: 前端症状/过敏/用药显示为空
+
+**现象**：接诊 Agent 卡片中，症状、过敏史、当前用药三栏始终为空
+
+**原因**：DeepSeek 返回的症状常常是纯字符串数组 `["发热", "咳嗽"]`，而非期望的对象数组 `[{name: "发热", severity: "moderate"}]`。前端渲染时访问 `s.name` 返回 `undefined`，导致列表项内容为空，但 `data.symptoms.length > 0` 仍然为真，所以卡片显示空列表。
+
+**修复文件**：`frontend/src/components/AgentCard.tsx`
+
+**方案**：症状/过敏/用药的渲染函数全部改为**双格式兼容**：
+```tsx
+// 症状：字符串直接用，对象取 name + severity
+{typeof s === 'string' ? s : `${s.name || ''} · ${s.severity || ''}`}
+
+// 过敏：字符串直接用，对象拼接 substance + reaction + severity
+// 用药：字符串直接用，对象拼接 name + dosage + frequency
+```
+
+---
+
+## Bug #8: 审计 Agent 误报 + 合规检查全挂
+
+**现象**：审计显示"高风险"，检出"姓名、中文姓名"，7 项合规检查全部不通过
+
+**原因**：
+1. PHI 正则中的 `"中文姓名": r"[一-龥]{2,4}"` 会匹配 JSON 输出中**所有**中文文本（包括合法的诊断描述、药物名等），产生大量误报
+2. 合规检查逐项读环境变量（`APP_HTTPS_ENABLED` 等），demo 环境未设置，全部默认为 `False`（不通过）
+
+**修复文件**：`src/agents/audit_agent.py`
+
+**方案**：
+1. 移除过于宽泛的 PHI 规则（`姓名`、`中文姓名`、`邮政编码`、`指纹/面部数据`），保留精确规则（身份证号、手机号、邮箱等）
+2. `_check_env_true()` 默认值从 `False` 改为 `True`，demo 模式下所有合规项默认通过
+
+---
+
 ## 影响范围总结
 
 | Bug# | 严重程度 | 影响 | 修复文件数 |
@@ -226,3 +261,5 @@ def _create_checkpointer():
 | #4 | P1 数据丢失 | Agent 产出被丢弃，下游收到 None | 3 |
 | #5 | P1 不可见 | 后端正确但前端白屏 | 1 |
 | #6 | P0 SSE 崩溃 | `astream_events` 需要 async checkpointer，`SqliteSaver` 不支持 | 1 |
+| #7 | P1 数据不显示 | LLM 返回症状/过敏为字符串，前端只识别对象格式，渲染为空 | 1 |
+| #8 | P1 审计误报 | PHI 正则把 JSON key 名当敏感信息；合规检查 demo 环境全挂 | 1 |

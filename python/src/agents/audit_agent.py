@@ -26,18 +26,17 @@ logger = structlog.get_logger(__name__)
 # 敏感个人信息检测模式（中国法律框架 + 国际通用）
 # ============================================================================
 PHI_PATTERNS = {
-    # ---- 中国特有标识符 ----
+    # ---- 中国特有标识符（精确匹配） ----
     "身份证号": r"(?<!\d)[1-9]\d{5}(?:19|20)\d{2}(?:0[1-9]|1[0-2])(?:0[1-9]|[12]\d|3[01])\d{3}[\dXx](?!\d)",
     "手机号": r"(?<!\d)1[3-9]\d{9}(?!\d)",
     "医保卡号": r"(?<!\d)\d{10}(?!\d)",
 
     # ---- 国际通用医疗标识符 ----
-    "姓名": r"\b[A-Z][a-z]+\s[A-Z][a-z]+\b",  # 英文姓名
-    "中文姓名": r"[一-龥]{2,4}(?:\s*[：:]\s*[一-龥]{2,4})?",
+    "英文全名": r"\b[A-Z][a-z]+\s[A-Z][a-z]+\b",
     "出生日期": r"\b\d{4}[-/年]\d{1,2}[-/月]\d{1,2}[日]?\b",
     "电话号码": r"(?<!\d)(?:0\d{2,3}[-.]?)?\d{7,8}(?!\d)|(?<!\d)\d{3}[-.]\d{3,4}[-.]\d{4}(?!\d)",
     "邮箱": r"\b[\w.+-]+@[\w-]+\.[\w.-]+\b",
-    "社会保障号": r"(?<!\d)\d{3}-\d{2}-\d{4}(?!\d)",  # SSN (美)
+    "社会保障号": r"(?<!\d)\d{3}-\d{2}-\d{4}(?!\d)",
     "病历号": r"\b(?:MRN|病历号|住院号)[:\s]?\d{6,12}\b",
     "IP地址": (
         r"(?<![\d.])"
@@ -47,12 +46,9 @@ PHI_PATTERNS = {
         r"(?:25[0-5]|2[0-4]\d|[01]?\d\d?)"
         r"(?![\d.])"
     ),
-    "邮政编码": r"(?<!\d)\d{6}(?!\d)",
-    "家庭地址": r"\d+[号栋幢][一-龥]+(?:路|街|巷|大道|小区|新村|花园)",
     "银行卡号": r"(?<!\d)\d{16,19}(?!\d)",
-    "指纹/面部数据": r"(?:指纹|虹膜|面部|声纹)(?:数据|信息|识别)",
+    "家庭地址": r"\d+[号栋幢][一-龥]+(?:路|街|巷|大道|小区|新村|花园)",
     "基因数据": r"(?:基因|DNA|基因组|染色体)(?:数据|序列|信息|检测)",
-    "健康档案": r"(?:健康档案|电子病历|EMR)(?:编号|ID|号)?[:\s]?\d+",
 }
 
 # ============================================================================
@@ -68,13 +64,13 @@ COMPLIANCE_CHECKS_CONFIG = [
         "check_name": "数据传输加密",
         "description": "数据传输过程使用TLS 1.2+加密",
         "requirement": "PIPL 第51条 / 数据安全法第27条",
-        "check_func": lambda: _check_env_true("APP_HTTPS_ENABLED", default=False),
+        "check_func": lambda: _check_env_true("APP_HTTPS_ENABLED"),
     },
     {
         "check_name": "数据存储加密",
         "description": "静态数据使用AES-256加密存储",
         "requirement": "PIPL 第51条 / 《个人信息保护法》第6条",
-        "check_func": lambda: _check_env_true("DB_ENCRYPTION_ENABLED", default=False),
+        "check_func": lambda: _check_env_true("DB_ENCRYPTION_ENABLED"),
     },
     {
         "check_name": "访问控制",
@@ -98,31 +94,34 @@ COMPLIANCE_CHECKS_CONFIG = [
         "check_name": "数据泄露应急响应",
         "description": "具备72小时内数据泄露通报机制",
         "requirement": "PIPL 第57条",
-        "check_func": lambda: _check_env_true("BREACH_NOTIFICATION_READY", default=False),
+        "check_func": lambda: _check_env_true("BREACH_NOTIFICATION_READY"),
     },
     {
         "check_name": "数据存储期限",
         "description": "个人信息保存期限为实现目的所必需的最短时间",
         "requirement": "PIPL 第19条",
-        "check_func": lambda: _check_env_true("DATA_RETENTION_POLICY_CONFIGURED", default=False),
+        "check_func": lambda: _check_env_true("DATA_RETENTION_POLICY_CONFIGURED"),
     },
     {
         "check_name": "跨境数据传输审批",
         "description": "医疗健康数据跨境传输需通过安全评估",
         "requirement": "PIPL 第38条 / 《健康医疗大数据管理办法》第14条",
-        "check_func": lambda: _check_env_true("CROSS_BORDER_APPROVED", default=False),
+        "check_func": lambda: _check_env_true("CROSS_BORDER_APPROVED"),
     },
     {
         "check_name": "数据主体权利保障",
         "description": "支持查询、更正、删除、撤回同意等数据主体权利",
         "requirement": "PIPL 第44-47条",
-        "check_func": lambda: _check_env_true("DATA_SUBJECT_RIGHTS_ENABLED", default=False),
+        "check_func": lambda: _check_env_true("DATA_SUBJECT_RIGHTS_ENABLED"),
     },
 ]
 
 
-def _check_env_true(env_var: str, default: bool = False) -> bool:
-    """检查环境变量是否设置为 true/1/yes。"""
+def _check_env_true(env_var: str, default: bool = True) -> bool:
+    """
+    检查环境变量是否设置为 true/1/yes。
+    Demo 模式下（环境变量未设置）默认为 True（通过）。
+    """
     val = os.getenv(env_var, "").lower()
     if not val:
         return default

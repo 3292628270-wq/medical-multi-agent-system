@@ -17,31 +17,43 @@ function renderPatientInfo(data: PatientInfo) {
       {data.symptoms?.length > 0 && (
         <div className="info-section">
           <label>症状</label>
-          <ul>{data.symptoms.map((s, i) => (
-            <li key={i}>{s.name} · {s.severity}{s.duration_days ? ` · ${s.duration_days}天` : ''}</li>
+          <ul>{data.symptoms.map((s: any, i: number) => (
+            <li key={i}>
+              {typeof s === 'string' ? s : `${s.name || s.symptom || ''} · ${s.severity || ''}${s.duration_days ? ` · ${s.duration_days}天` : ''}`}
+            </li>
           ))}</ul>
         </div>
       )}
       {data.medical_history?.length > 0 && (
         <div className="info-section">
           <label>既往病史</label>
-          <ul>{data.medical_history.map((h, i) => <li key={i}>{h}</li>)}</ul>
+          <ul>{data.medical_history.map((h: any, i: number) => (
+            <li key={i}>{typeof h === 'string' ? h : h.name || h.condition || JSON.stringify(h)}</li>
+          ))}</ul>
         </div>
       )}
       {data.allergies?.length > 0 && (
         <div className="info-section">
           <label>过敏史</label>
-          <ul>{data.allergies.map((a, i) => (
-            <li key={i}>{a.substance}{a.reaction ? ` → ${a.reaction}` : ''} · {a.severity}</li>
-          ))}</ul>
+          <ul>{data.allergies.map((a: any, i: number) => {
+            if (typeof a === 'string') return <li key={i}>{a}</li>
+            const sub = a.substance || a.name || a.allergen || ''
+            const rxn = a.reaction || ''
+            const sev = a.severity || ''
+            return <li key={i}>{[sub, rxn, sev].filter(Boolean).join(' · ')}</li>
+          })}</ul>
         </div>
       )}
       {data.current_medications?.length > 0 && (
         <div className="info-section">
           <label>当前用药</label>
-          <ul>{data.current_medications.map((m, i) => (
-            <li key={i}>{m.name}{m.dosage ? ` ${m.dosage}` : ''}{m.frequency ? ` ${m.frequency}` : ''}</li>
-          ))}</ul>
+          <ul>{data.current_medications.map((m: any, i: number) => {
+            if (typeof m === 'string') return <li key={i}>{m}</li>
+            const name = m.name || m.drug_name || m.drug || ''
+            const dose = m.dosage || m.dose || ''
+            const freq = m.frequency || m.freq || ''
+            return <li key={i}>{[name, dose, freq].filter(Boolean).join(' ')}</li>
+          })}</ul>
         </div>
       )}
     </div>
