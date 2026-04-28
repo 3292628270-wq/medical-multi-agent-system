@@ -78,18 +78,16 @@ class TestDiagnosisAgent:
         assert result["current_agent"] == "diagnosis"
         assert len(result["errors"]) > 0
 
-    def test_graphrag_fallback_on_no_symptoms(self):
-        """无有效症状时 GraphRAG 检索跳过，LLM 直接推理"""
+    def test_graphrag_skips_on_no_symptoms(self):
+        """无有效症状时 GraphRAG 检索跳过，LLM 仍可基于其他信息推理"""
         from src.agents.diagnosis_agent import diagnosis_agent
 
-        # patient_info 有数据但没有 symptoms 字段
-        state = _make_state(patient_info={"name": "test", "age": 30})
+        state = _make_state(patient_info={"name": "test", "age": 30, "chief_complaint": "头痛"})
         result = diagnosis_agent(state)
 
-        # 应该走到 LLM 调用（会因为没有 API key 而失败，但至少证明路由正确）
         assert result["current_agent"] == "diagnosis"
-        # LLM 调用失败会落入 except 分支
-        assert len(result["errors"]) > 0
+        # 即使无 symptoms，LLM 也能基于 chief_complaint 等给出诊断
+        assert result["diagnosis"] is not None
 
 
 # ============================================================
