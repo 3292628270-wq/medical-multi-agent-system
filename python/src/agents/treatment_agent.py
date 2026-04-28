@@ -57,13 +57,21 @@ def treatment_agent(state) -> dict:
             "errors": state.errors + ["No diagnosis available for treatment planning"],
         }
 
-    # ---- Step 1: 提取当前用药和过敏信息 ----
-    current_drug_names = [
-        m.get("name", "") for m in patient_info.get("current_medications", [])
-    ]
-    allergies = [
-        a.get("substance", "") for a in patient_info.get("allergies", [])
-    ]
+    # ---- Step 1: 提取当前用药和过敏信息（容错非dict元素） ----
+    raw_meds = patient_info.get("current_medications", []) or []
+    raw_allergies = patient_info.get("allergies", []) or []
+    current_drug_names = []
+    for m in raw_meds:
+        if isinstance(m, dict):
+            current_drug_names.append(m.get("name", ""))
+        elif isinstance(m, str):
+            current_drug_names.append(m)
+    allergies = []
+    for a in raw_allergies:
+        if isinstance(a, dict):
+            allergies.append(a.get("substance", ""))
+        elif isinstance(a, str):
+            allergies.append(a)
 
     # ---- Step 2: LLM 推理 ----
     structured_llm = get_structured_llm(TreatmentOutput, temperature=0.2)

@@ -66,5 +66,6 @@ def intake_agent(state) -> dict:
         return {
             "patient_info": None,
             "current_agent": "intake",
+            "diagnosis_retry_count": state.diagnosis_retry_count + 1,
             "errors": state.errors + [f"Intake提取失败: {e}"],
         }

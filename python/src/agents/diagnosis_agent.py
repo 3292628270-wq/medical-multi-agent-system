@@ -56,7 +56,18 @@ def diagnosis_agent(state) -> dict:
         }
 
     # ---- Step 1: GraphRAG 确定性检索 ----
-    symptoms = [s["name"] for s in patient_info.get("symptoms", []) if s.get("name")]
+    # 容错：症状可能是 dict(name=...) 或纯字符串
+    raw_symptoms = patient_info.get("symptoms", []) or []
+    symptoms = []
+    for s in raw_symptoms:
+        if isinstance(s, dict):
+            name = s.get("name", "") or s.get("symptom", "") or ""
+        elif isinstance(s, str):
+            name = s
+        else:
+            name = ""
+        if name:
+            symptoms.append(name)
     chief = patient_info.get("chief_complaint", "")
     rag_context = ""
     if symptoms:

@@ -49,9 +49,11 @@ def _create_checkpointer():
     优先使用 SqliteSaver（磁盘持久化），不可用时回退 MemorySaver（内存）。
     """
     try:
+        import sqlite3
         from langgraph.checkpoint.sqlite import SqliteSaver
         _CHECKPOINT_DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-        checkpointer = SqliteSaver.from_conn_string(str(_CHECKPOINT_DB_PATH))
+        conn = sqlite3.connect(str(_CHECKPOINT_DB_PATH), check_same_thread=False)
+        checkpointer = SqliteSaver(conn)
         logger.info("checkpointer.sqlite_ready", path=str(_CHECKPOINT_DB_PATH))
         return checkpointer
     except Exception as e:

@@ -3,10 +3,12 @@
 与 domain models (patient.py, diagnosis.py, treatment.py) 的区别：
   - 这里的模型仅包含 LLM 需要输出的字段，不含内部字段 (如 created_at)
   - 使用简单类型 (str 代替 Enum, dict 代替复杂嵌套)，减少 LLM 输出错误
+  - 所有必填字段均设默认值，兼容 DeepSeek 等输出不全的情况
 """
 
 from __future__ import annotations
-from pydantic import BaseModel, Field
+from typing import Any
+from pydantic import BaseModel, Field, model_validator
 
 
 # ---- Intake Agent ----
@@ -48,18 +50,47 @@ class LabResultOutput(BaseModel):
 
 
 class IntakeOutput(BaseModel):
-    """LLM接诊信息提取结构"""
-    name: str = Field(description="患者姓名")
-    age: int = Field(ge=0, description="年龄")
-    gender: str = Field(description="性别: male|female|other|unknown")
-    chief_complaint: str = Field(description="主诉")
-    symptoms: list[SymptomOutput] = Field(default_factory=list, description="症状列表")
+    """LLM接诊信息提取结构（所有必填字段均有默认值，兼容LLM输出不全的情况）"""
+    name: str = Field(default="未知", description="患者姓名")
+    age: int = Field(default=0, ge=0, description="年龄")
+    gender: str = Field(default="unknown", description="性别: male|female|other|unknown")
+    chief_complaint: str = Field(default="未提供", description="主诉")
+    symptoms: list[Any] = Field(default_factory=list, description="症状列表")
     medical_history: list[str] = Field(default_factory=list, description="既往病史")
     family_history: list[str] = Field(default_factory=list, description="家族病史")
-    allergies: list[AllergyOutput] = Field(default_factory=list, description="过敏史")
-    current_medications: list[MedicationOutput] = Field(default_factory=list, description="当前用药")
-    vital_signs: VitalSignsOutput | None = Field(default=None, description="生命体征")
-    lab_results: list[LabResultOutput] = Field(default_factory=list, description="实验室检查结果")
+    allergies: list[Any] = Field(default_factory=list, description="过敏史")
+    current_medications: list[Any] = Field(default_factory=list, description="当前用药")
+    vital_signs: Any = Field(default=None, description="生命体征")
+    lab_results: list[Any] = Field(default_factory=list, description="实验室检查结果")
+
+    @model_validator(mode="before")
+    @classmethod
+    def coerce_fields(cls, data: Any) -> Any:
+        """将 LLM 可能返回的非预期类型转为安全值。"""
+        if not isinstance(data, dict):
+            return data
+        # 字符串字段：null → 默认值
+        for str_field in ("name", "gender", "chief_complaint"):
+            if data.get(str_field) is None:
+                data[str_field] = "未知" if str_field == "name" else ""
+        # list 字段：null → []
+        for list_field in ("symptoms", "medical_history", "family_history",
+                           "allergies", "current_medications", "lab_results"):
+            if data.get(list_field) is None:
+                data[list_field] = []
+        # vital_signs: 非 dict 时置为 None
+        if "vital_signs" in data and not isinstance(data["vital_signs"], dict):
+            data["vital_signs"] = None
+        # age: 确保为整数
+        if "age" in data:
+            if isinstance(data["age"], str):
+                try:
+                    data["age"] = int(data["age"])
+                except ValueError:
+                    data["age"] = 0
+            elif data["age"] is None:
+                data["age"] = 0
+        return data
 
 
 # ---- Diagnosis Agent ----
@@ -82,6 +113,16 @@ class DiagnosisOutput(BaseModel):
     clinical_notes: str = Field(default="", description="临床印象")
     knowledge_sources: list[str] = Field(default_factory=list, description="知识来源")
     needs_more_info: bool = Field(default=False, description="是否需要更多信息")
+
+    @model_validator(mode="before")
+    @classmethod
+    def coerce_fields(cls, data: Any) -> Any:
+        if not isinstance(data, dict):
+            return data
+        for list_f in ("differential_list", "recommended_tests", "knowledge_sources"):
+            if data.get(list_f) is None:
+                data[list_f] = []
+        return data
 
 
 # ---- Treatment Agent ----
@@ -107,7 +148,7 @@ class DrugInteractionOutput(BaseModel):
 
 class TreatmentOutput(BaseModel):
     """LLM治疗方案提取结构"""
-    diagnosis_addressed: str = Field(description="目标诊断")
+    diagnosis_addressed: str = Field(default="", description="目标诊断")
     medications: list[PrescribedMedicationOutput] = Field(default_factory=list, description="用药方案")
     drug_interactions: list[DrugInteractionOutput] = Field(
         default_factory=list, description="药物相互作用"
@@ -117,6 +158,17 @@ class TreatmentOutput(BaseModel):
     follow_up_plan: str = Field(default="", description="随访计划")
     warnings: list[str] = Field(default_factory=list, description="重要警告")
     evidence_references: list[str] = Field(default_factory=list, description="循证参考文献")
+
+    @model_validator(mode="before")
+    @classmethod
+    def coerce_fields(cls, data: Any) -> Any:
+        if not isinstance(data, dict):
+            return data
+        for list_f in ("medications", "drug_interactions", "non_drug_treatments",
+                        "lifestyle_recommendations", "warnings", "evidence_references"):
+            if data.get(list_f) is None:
+                data[list_f] = []
+        return data
 
 
 # ---- Coding Agent ----
@@ -143,4 +195,24 @@ class CodingOutput(BaseModel):
     )
     drg_group: DRGGroupOutput | None = Field(default=None, description="DRG分组")
     coding_notes: str = Field(default="", description="编码说明")
-    coding_confidence: float = Field(ge=0.0, le=1.0, description="整体编码置信度")
+    coding_confidence: float = Field(ge=0.0, le=1.0, default=0.0, description="整体编码置信度")
+
+    @model_validator(mode="before")
+    @classmethod
+    def coerce_fields(cls, data: Any) -> Any:
+        if not isinstance(data, dict):
+            return data
+        # drg_group 中的 null 值修复
+        if isinstance(data.get("drg_group"), dict):
+            dg = data["drg_group"]
+            for f in ("weight", "mean_los"):
+                if dg.get(f) is None:
+                    dg[f] = 0.0
+            if dg.get("drg_code") is None:
+                dg["drg_code"] = ""
+            if dg.get("description") is None:
+                dg["description"] = ""
+        # confidence null → 0
+        if data.get("coding_confidence") is None:
+            data["coding_confidence"] = 0.0
+        return data
