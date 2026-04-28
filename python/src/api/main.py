@@ -1,22 +1,21 @@
 """
 FastAPI application entry point.
-
-Provides REST API for the clinical decision pipeline.
 """
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
+from pathlib import Path
 
 from .routes import router
 
 app = FastAPI(
-    title="Multi-Agent Clinical Decision Support System",
+    title="多Agent医疗临床辅助决策系统",
     description=(
-        "Enterprise-grade multi-agent system for clinical decision support. "
-        "Five specialized agents collaborate through a LangGraph pipeline: "
-        "Intake, Diagnosis, Treatment, Coding, and Audit."
+        "企业级多Agent医疗临床辅助决策系统。"
+        "5个专业Agent通过LangGraph管线协作：接诊、诊断、治疗、编码、审计。"
     ),
-    version="1.0.0",
+    version="2.0.0",
     docs_url="/docs",
     redoc_url="/redoc",
 )
@@ -31,7 +30,12 @@ app.add_middleware(
 
 app.include_router(router, prefix="/api/v1")
 
+# 前端静态文件
+static_dir = Path(__file__).parent.parent.parent / "static"
+static_dir.mkdir(exist_ok=True)
+app.mount("/", StaticFiles(directory=str(static_dir), html=True), name="static")
+
 
 @app.get("/health")
 def health_check():
-    return {"status": "healthy", "service": "clinical-decision-system", "version": "1.0.0"}
+    return {"status": "healthy", "service": "clinical-decision-system", "version": "2.0.0"}
