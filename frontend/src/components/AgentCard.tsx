@@ -234,12 +234,32 @@ export const AgentCard: React.FC<Props> = ({ agent }) => {
   const renderContent = () => {
     if (!agent.output) return <p className="no-data">暂无输出</p>
     const data = agent.output as Record<string, unknown>
-    if (agent.name === 'intake' && data.name) return renderPatientInfo(data as unknown as PatientInfo)
-    if (agent.name === 'diagnosis' && data.primary_diagnosis) return renderDiagnosis(data as unknown as DiagnosisData)
-    if (agent.name === 'treatment' && data.diagnosis_addressed) return renderTreatment(data as unknown as TreatmentData)
-    if (agent.name === 'coding' && data.primary_icd10) return renderCoding(data as unknown as CodingData)
-    if (agent.name === 'audit' && data.compliance_checks) return renderAudit(data as unknown as AuditData)
-    if (data.errors) return <p className="error-text">{JSON.stringify(data.errors)}</p>
+    // LangGraph Agent 节点返回的是 {核心字段, current_agent, ...}，
+    // 需要提取嵌套的核心数据字段
+    const nested = (key: string) => (data[key] || data) as Record<string, unknown>
+    if (agent.name === 'intake' && data.patient_info) {
+      const inner = nested('patient_info')
+      if (inner && inner.name) return renderPatientInfo(inner as unknown as PatientInfo)
+    }
+    if (agent.name === 'diagnosis' && data.diagnosis) {
+      const inner = nested('diagnosis')
+      if (inner && inner.primary_diagnosis) return renderDiagnosis(inner as unknown as DiagnosisData)
+    }
+    if (agent.name === 'treatment' && data.treatment_plan) {
+      const inner = nested('treatment_plan')
+      if (inner && inner.diagnosis_addressed) return renderTreatment(inner as unknown as TreatmentData)
+    }
+    if (agent.name === 'coding' && data.coding_result) {
+      const inner = nested('coding_result')
+      if (inner && inner.primary_icd10) return renderCoding(inner as unknown as CodingData)
+    }
+    if (agent.name === 'audit') {
+      const inner = nested('audit_result')
+      if (inner && inner.compliance_checks) return renderAudit(inner as unknown as AuditData)
+    }
+    if (data.errors && Array.isArray(data.errors) && data.errors.length > 0) {
+      return <p className="error-text">{JSON.stringify(data.errors)}</p>
+    }
     return <pre className="json-preview">{JSON.stringify(data, null, 2)}</pre>
   }
 
