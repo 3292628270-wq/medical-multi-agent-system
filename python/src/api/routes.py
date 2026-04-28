@@ -11,6 +11,7 @@ Endpoints:
 
 from __future__ import annotations
 import json
+import re
 from fastapi import APIRouter, HTTPException
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
@@ -21,6 +22,45 @@ from ..services.drug_interaction import check_interactions
 
 # Agent 节点名称，用于 astream_events 过滤
 AGENT_NAMES = {"intake", "diagnosis", "treatment", "coding", "audit"}
+
+# ---- 输入安全防护 ----
+
+MAX_INPUT_LENGTH = 5000  # 最大输入字符数
+
+# Prompt injection 基础检测模式
+_INJECTION_PATTERNS = [
+    r"ignore\s+(all\s+)?(previous|above|prior|上述|前面|之前)\s*(的)?\s*instructions?",
+    r"(ignore|disregard|forget|忘记|忽略)\s+(all\s+)?(previous|above|系统)",
+    r"system\s*(prompt|message|instruction|提示)",
+    r"you\s+are\s+now\s+a(n)?\s",
+    r"\[INST\]", r"\[SYS\]",
+    r"<\|im_start\|>", r"<\|im_end\|>",
+    r"你(现在|已经)\s*(是|变成|成为)\s*(一个|一名)",
+    r"忽略你的(系统)?(提示|指令|规则)",
+    r"输出你的(系统)?(提示词|指令)",
+]
+
+
+def _validate_input(patient_description: str) -> None:
+    """
+    输入安全校验。
+    检测 prompt injection 攻击模式和输入长度超限。
+    """
+    # 长度检查
+    if len(patient_description) > MAX_INPUT_LENGTH:
+        raise HTTPException(
+            status_code=400,
+            detail=f"输入过长（{len(patient_description)}字符），最大允许 {MAX_INPUT_LENGTH} 字符",
+        )
+
+    # Prompt injection 检测
+    for pattern in _INJECTION_PATTERNS:
+        if re.search(pattern, patient_description, re.IGNORECASE):
+            raise HTTPException(
+                status_code=400,
+                detail="输入包含无效内容，请重新提交",
+            )
+
 
 router = APIRouter(tags=["Clinical Decision"])
 
@@ -73,8 +113,9 @@ async def analyze_patient(req: AnalyzeRequest):
     2. Diagnosis Agent → differential diagnosis
     3. Treatment Agent → evidence-based treatment plan
     4. Coding Agent → ICD-10 codes + DRGs
-    5. Audit Agent → HIPAA compliance report
+    5. Audit Agent → 中国合规审计报告
     """
+    _validate_input(req.patient_description)
     pipeline = get_pipeline()
 
     try:
@@ -105,6 +146,7 @@ async def analyze_patient_stream(req: AnalyzeRequest):
     事件格式：data: {"agent": "intake", "output": {...}, "complete": false}
     结束事件：data: {"agent": null, "output": null, "complete": true}
     """
+    _validate_input(req.patient_description)
     pipeline = get_pipeline()
 
     async def event_stream():
