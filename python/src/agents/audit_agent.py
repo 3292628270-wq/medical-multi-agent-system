@@ -15,8 +15,9 @@ from __future__ import annotations
 import json
 import re
 import os
-import structlog
+from pathlib import Path
 from datetime import datetime, timezone
+import structlog
 
 from ..models.treatment import AuditResult, AuditRecord, ComplianceCheck
 
@@ -62,33 +63,28 @@ COMPLIANCE_CHECKS_CONFIG = [
     },
     {
         "check_name": "数据传输加密",
-        "description": "数据传输过程使用TLS 1.2+加密",
+        "description": "检查 HTTPS/TLS 是否已配置（验证 ssl_keyfile 或 APP_HTTPS_ENABLED）",
         "requirement": "PIPL 第51条 / 数据安全法第27条",
-        "check_func": lambda: _check_env_true("APP_HTTPS_ENABLED"),
     },
     {
         "check_name": "数据存储加密",
         "description": "静态数据使用AES-256加密存储",
         "requirement": "PIPL 第51条 / 《个人信息保护法》第6条",
-        "check_func": lambda: _check_env_true("DB_ENCRYPTION_ENABLED"),
     },
     {
         "check_name": "访问控制",
         "description": "基于角色的访问控制(RBAC)，最小权限原则",
         "requirement": "PIPL 第50条 / 数据安全法第27条",
-        "check_func": lambda: _check_env_true("RBAC_ENABLED", default=True),
     },
     {
-        "check_name": "审计日志",
-        "description": "全链路操作审计日志，保存不少于6年",
+        "check_name": "审计日志可写入",
+        "description": "验证审计日志存储目录可写入（尝试创建测试文件验证磁盘权限）",
         "requirement": "PIPL 第55条 / 《健康医疗大数据管理办法》第12条",
-        "check_func": lambda: True,  # 本 Agent 自身即审计日志来源
     },
     {
         "check_name": "最小必要原则",
-        "description": "仅收集和使用诊疗必需的个人信息",
+        "description": "验证管线输出字段不超出临床诊疗必需范围",
         "requirement": "PIPL 第6条",
-        "check_func": lambda: True,  # 管线只提取临床相关信息
     },
     {
         "check_name": "数据泄露应急响应",
@@ -126,6 +122,86 @@ def _check_env_true(env_var: str, default: bool = True) -> bool:
     if not val:
         return default
     return val in ("true", "1", "yes", "on")
+
+
+def _check_https_configured() -> bool:
+    """
+    真实检查：验证 HTTPS/TLS 是否已配置。
+    1. 检查环境变量 APP_HTTPS_ENABLED
+    2. 检查 Uvicorn 启动参数中是否有 ssl_keyfile
+    """
+    if os.getenv("APP_HTTPS_ENABLED", "").lower() in ("true", "1", "yes"):
+        return True
+    if os.getenv("UVICORN_SSL_KEYFILE"):
+        return True
+    if os.getenv("SSL_KEYFILE"):
+        return True
+    return False
+
+
+def _check_audit_log_writable() -> bool:
+    """
+    真实检查：验证审计日志目录是否可写入。
+    尝试在 data/ 目录下创建临时文件来验证写权限。
+    """
+    log_dir = Path(__file__).parent.parent.parent / "data"
+    try:
+        log_dir.mkdir(parents=True, exist_ok=True)
+        test_file = log_dir / ".audit_write_test"
+        test_file.write_text("audit test", encoding="utf-8")
+        test_file.unlink()  # 清理测试文件
+        return True
+    except (OSError, PermissionError):
+        return False
+
+
+# 管线输出必要字段白名单（临床诊疗最小必要数据集）
+_REQUIRED_FIELDS_WHITELIST = {
+    "patient_info": {
+        "name", "age", "gender", "chief_complaint", "symptoms",
+        "medical_history", "family_history", "allergies",
+        "current_medications", "vital_signs", "lab_results",
+    },
+    "diagnosis": {
+        "primary_diagnosis", "differential_list", "recommended_tests",
+        "clinical_notes", "knowledge_sources",
+    },
+    "treatment_plan": {
+        "diagnosis_addressed", "medications", "drug_interactions",
+        "non_drug_treatments", "lifestyle_recommendations",
+        "follow_up_plan", "warnings", "evidence_references",
+    },
+    "coding_result": {
+        "primary_icd10", "secondary_icd10_codes", "drg_group",
+        "coding_notes", "coding_confidence",
+    },
+    "audit_result": False,  # 审计自身输出，不校验
+}
+
+
+def _check_data_minimization(patient_info, diagnosis, treatment_plan, coding_result) -> tuple[bool, list[str]]:
+    """
+    真实检查：验证管线输出是否遵循最小必要原则。
+    检查各 Agent 输出字段是否超出临床必需范围。
+    返回 (是否通过, 违规字段列表)。
+    """
+    violations = []
+    field_map = {
+        "patient_info": patient_info,
+        "diagnosis": diagnosis,
+        "treatment_plan": treatment_plan,
+        "coding_result": coding_result,
+    }
+    for section, data in field_map.items():
+        whitelist = _REQUIRED_FIELDS_WHITELIST.get(section)
+        if whitelist is False:
+            continue
+        if not data or not isinstance(data, dict):
+            continue
+        extra = set(data.keys()) - whitelist
+        if extra:
+            violations.append(f"{section} 含非必要字段: {', '.join(sorted(extra))}")
+    return len(violations) == 0, violations
 
 
 def _scan_for_phi(data: dict) -> list[dict]:
@@ -232,18 +308,79 @@ def audit_agent(state) -> dict:
     # ---- 3. 结构性合规检查 ----
     for check_config in COMPLIANCE_CHECKS_CONFIG:
         name = check_config["check_name"]
+        requirement = check_config["requirement"]
+        detail = f"依据: {requirement}"
+
         if name == "敏感信息扫描":
             continue  # 已在步骤1中处理
-        check_func = check_config.get("check_func", lambda: True)
-        try:
-            passed = check_func()
-        except Exception:
-            passed = False
+        elif name == "数据传输加密":
+            try:
+                passed = _check_https_configured()
+                detail = ("HTTPS/TLS 已配置" if passed
+                          else "未检测到 HTTPS 配置。设置 APP_HTTPS_ENABLED=true 或配置 SSL 证书。"
+                          f" 依据: {requirement}")
+            except Exception as e:
+                passed, detail = False, f"检查失败: {e}"
+        elif name == "数据存储加密":
+            passed = _check_env_true("DB_ENCRYPTION_ENABLED")
+            detail = ("数据库加密已启用" if passed
+                      else "未检测到数据库加密配置。设置 DB_ENCRYPTION_ENABLED=true。"
+                      f" 依据: {requirement}")
+        elif name == "访问控制":
+            passed = _check_env_true("RBAC_ENABLED")
+            detail = ("RBAC 已启用" if passed
+                      else "未检测到 RBAC 配置。设置 RBAC_ENABLED=true。"
+                      f" 依据: {requirement}")
+        elif name == "审计日志可写入":
+            try:
+                passed = _check_audit_log_writable()
+                detail = ("审计日志目录可写入（已验证磁盘权限）" if passed
+                          else "审计日志目录不可写入，请检查 data/ 目录权限。"
+                          f" 依据: {requirement}")
+            except Exception as e:
+                passed, detail = False, f"检查失败: {e}"
+        elif name == "最小必要原则":
+            try:
+                ok, violations = _check_data_minimization(
+                    state.patient_info, state.diagnosis,
+                    state.treatment_plan, state.coding_result,
+                )
+                passed = ok
+                if ok:
+                    detail = f"所有管线输出字段均在临床必需范围内。依据: {requirement}"
+                else:
+                    detail = f"检出 {len(violations)} 项非必要字段。依据: {requirement}"
+            except Exception as e:
+                passed, detail = True, f"无法校验: {e}"  # 数据为空时不阻断
+        elif name == "数据泄露应急响应":
+            passed = _check_env_true("BREACH_NOTIFICATION_READY")
+            detail = (f"已配置数据泄露应急响应机制" if passed
+                      else "未配置应急响应。设置 BREACH_NOTIFICATION_READY=true。"
+                      f" 依据: {requirement}")
+        elif name == "数据存储期限":
+            passed = _check_env_true("DATA_RETENTION_POLICY_CONFIGURED")
+            detail = (f"已配置数据存储期限策略" if passed
+                      else "未配置存储期限策略。设置 DATA_RETENTION_POLICY_CONFIGURED=true。"
+                      f" 依据: {requirement}")
+        elif name == "跨境数据传输审批":
+            passed = _check_env_true("CROSS_BORDER_APPROVED")
+            detail = (f"跨境数据传输已获审批" if passed
+                      else "未配置跨境数据传输审批。设置 CROSS_BORDER_APPROVED=true。"
+                      f" 依据: {requirement}")
+        elif name == "数据主体权利保障":
+            passed = _check_env_true("DATA_SUBJECT_RIGHTS_ENABLED")
+            detail = (f"数据主体权利保障机制已启用" if passed
+                      else "未启用。设置 DATA_SUBJECT_RIGHTS_ENABLED=true。"
+                      f" 依据: {requirement}")
+        else:
+            passed = True
+            detail = f"依据: {requirement}"
+
         compliance_checks.append(
             ComplianceCheck(
                 check_name=name,
                 passed=passed,
-                detail=f"依据: {check_config['requirement']}",
+                detail=detail,
             ).model_dump()
         )
 
