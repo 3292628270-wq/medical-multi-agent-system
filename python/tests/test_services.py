@@ -43,14 +43,16 @@ class TestDrugInteraction:
         assert len(interactions) == 0
 
     def test_class_based_interaction(self):
-        interactions = check_interactions(["fluoxetine"], ["phenelzine"])
+        # SSRI (氟西汀) + MAOI (苯乙肼) → 5-羟色胺综合征（禁忌）
+        interactions = check_interactions(["氟西汀"], ["苯乙肼"])
         assert len(interactions) >= 1
         assert interactions[0]["severity"] == "contraindicated"
 
     def test_allergy_check(self):
-        result = check_allergy_contraindication("amoxicillin", ["penicillin"])
+        # 阿莫西林 → 青霉素过敏 → 禁忌
+        result = check_allergy_contraindication("阿莫西林", ["青霉素"])
         assert result is not None
-        assert result["severity"] == "major"
+        assert result["severity"] == "contraindicated"
 
 
 class TestHIPAAService:
@@ -79,13 +81,18 @@ class TestHIPAAService:
 class TestGraphRAGService:
     def test_symptom_lookup(self):
         svc = GraphRAGService()
-        results = svc.find_diseases_by_symptoms(["fever", "cough"])
+        results = svc.find_diseases_by_symptoms(["发热", "咳嗽"])
         assert len(results) > 0
         disease_names = [r["disease"] for r in results]
-        assert "Pneumonia" in disease_names
+        assert "肺炎" in disease_names
 
     def test_icd10_lookup(self):
         svc = GraphRAGService()
+        # 测试中文疾病名查找
+        result = svc.get_icd10("肺炎")
+        assert result is not None
+        assert result["code"] == "J18.9"
+        # 测试英文疾病名查找（向后兼容）
         result = svc.get_icd10("Pneumonia")
         assert result is not None
         assert result["code"] == "J18.9"
