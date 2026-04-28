@@ -2,19 +2,25 @@
 API route definitions.
 
 Endpoints:
-  POST /api/v1/clinical/analyze   — Run full pipeline on raw patient text
-  POST /api/v1/clinical/intake    — Run intake agent only
-  GET  /api/v1/clinical/icd10     — Search ICD-10 codes
-  GET  /api/v1/clinical/ddi       — Check drug interactions
+  POST /api/v1/clinical/analyze        — 运行完整管线（同步返回）
+  POST /api/v1/clinical/analyze/stream — 运行完整管线（SSE流式，逐个Agent返回）
+  POST /api/v1/clinical/icd10/search   — 搜索 ICD-10 编码
+  GET  /api/v1/clinical/icd10/{code}   — 查询单个 ICD-10 编码
+  POST /api/v1/clinical/ddi/check      — 检查药物相互作用
 """
 
 from __future__ import annotations
+import json
 from fastapi import APIRouter, HTTPException
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
 from ..graph.clinical_pipeline import get_pipeline
 from ..services.icd10_service import search_icd10_by_text, lookup_icd10, get_drg_group
 from ..services.drug_interaction import check_interactions
+
+# Agent 节点名称，用于 astream_events 过滤
+AGENT_NAMES = {"intake", "diagnosis", "treatment", "coding", "audit"}
 
 router = APIRouter(tags=["Clinical Decision"])
 
@@ -86,6 +92,54 @@ async def analyze_patient(req: AnalyzeRequest):
         )
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Pipeline error: {str(e)}")
+
+
+@router.post("/clinical/analyze/stream")
+async def analyze_patient_stream(req: AnalyzeRequest):
+    """
+    流式运行 5-Agent 临床决策管线。
+
+    使用 Server-Sent Events (SSE) 逐个返回每个 Agent 的输出，
+    前端可逐步渲染结果，无需等待全部完成。
+
+    事件格式：data: {"agent": "intake", "output": {...}, "complete": false}
+    结束事件：data: {"agent": null, "output": null, "complete": true}
+    """
+    pipeline = get_pipeline()
+
+    async def event_stream():
+        try:
+            async for event in pipeline.astream_events(
+                {"raw_input": req.patient_description},
+                config={"configurable": {"thread_id": req.thread_id}},
+                version="v2",
+            ):
+                kind = event.get("event")
+                name = event.get("name", "")
+
+                # 只处理 Agent 节点完成事件
+                if kind == "on_chain_end" and name in AGENT_NAMES:
+                    output = event.get("data", {}).get("output", {})
+                    # 只发送该 Agent 产出的关键字段
+                    payload = {"agent": name, "output": output, "complete": False}
+                    yield f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
+
+            # 管线完成
+            yield f"data: {json.dumps({'agent': None, 'output': None, 'complete': True}, ensure_ascii=False)}\n\n"
+
+        except Exception as e:
+            error_payload = {"agent": "error", "output": {"error": str(e)}, "complete": True}
+            yield f"data: {json.dumps(error_payload, ensure_ascii=False)}\n\n"
+
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",  # 禁用 Nginx 缓冲
+        },
+    )
 
 
 @router.post("/clinical/icd10/search")

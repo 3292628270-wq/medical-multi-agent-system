@@ -10,9 +10,8 @@ Intake Agent — 患者信息采集与结构化。
 from __future__ import annotations
 import structlog
 from langchain_core.messages import HumanMessage, SystemMessage
-from langchain_openai import ChatOpenAI
 
-from ..config.settings import get_settings
+from ..config.llm import get_structured_llm
 from ..models.llm_outputs import IntakeOutput
 
 logger = structlog.get_logger(__name__)
@@ -39,17 +38,12 @@ def intake_agent(state) -> dict:
         return {
             "patient_info": None,
             "current_agent": "intake",
+            "diagnosis_retry_count": state.diagnosis_retry_count + 1,
             "errors": state.errors + ["No raw input provided to Intake Agent"],
         }
 
-    settings = get_settings()
-    llm = ChatOpenAI(
-        model=settings.openai_model,
-        api_key=settings.openai_api_key,
-        temperature=0.1,
-    )
-    # 使用结构化输出，LLM自动返回校验后的IntakeOutput对象
-    structured_llm = llm.with_structured_output(IntakeOutput)
+    # 使用全局LLM单例 + 结构化输出
+    structured_llm = get_structured_llm(IntakeOutput, temperature=0.1)
 
     messages = [
         SystemMessage(content=INTAKE_SYSTEM_PROMPT),

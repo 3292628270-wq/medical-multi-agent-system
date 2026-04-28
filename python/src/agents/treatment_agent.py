@@ -12,9 +12,8 @@ from __future__ import annotations
 import json
 import structlog
 from langchain_core.messages import HumanMessage, SystemMessage
-from langchain_openai import ChatOpenAI
 
-from ..config.settings import get_settings
+from ..config.llm import get_structured_llm
 from ..models.llm_outputs import TreatmentOutput
 from ..services.drug_interaction import check_interactions, check_allergy_contraindication
 
@@ -67,13 +66,7 @@ def treatment_agent(state) -> dict:
     ]
 
     # ---- Step 2: LLM 推理 ----
-    settings = get_settings()
-    llm = ChatOpenAI(
-        model=settings.openai_model,
-        api_key=settings.openai_api_key,
-        temperature=0.2,
-    )
-    structured_llm = llm.with_structured_output(TreatmentOutput)
+    structured_llm = get_structured_llm(TreatmentOutput, temperature=0.2)
 
     context = json.dumps(
         {"patient_info": patient_info, "diagnosis": diagnosis},

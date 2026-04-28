@@ -11,9 +11,8 @@ from __future__ import annotations
 import json
 import structlog
 from langchain_core.messages import HumanMessage, SystemMessage
-from langchain_openai import ChatOpenAI
 
-from ..config.settings import get_settings
+from ..config.llm import get_structured_llm
 from ..models.llm_outputs import CodingOutput
 from ..services.icd10_service import lookup_icd10, search_icd10_by_text, get_drg_group
 
@@ -55,13 +54,7 @@ def coding_agent(state) -> dict:
         }
 
     # ---- Step 1: LLM 生成编码 ----
-    settings = get_settings()
-    llm = ChatOpenAI(
-        model=settings.openai_model,
-        api_key=settings.openai_api_key,
-        temperature=0.1,
-    )
-    structured_llm = llm.with_structured_output(CodingOutput)
+    structured_llm = get_structured_llm(CodingOutput, temperature=0.1)
 
     context = json.dumps(
         {"diagnosis": diagnosis, "treatment_plan": treatment},

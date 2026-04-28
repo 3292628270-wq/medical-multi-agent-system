@@ -12,9 +12,8 @@ from __future__ import annotations
 import json
 import structlog
 from langchain_core.messages import HumanMessage, SystemMessage
-from langchain_openai import ChatOpenAI
 
-from ..config.settings import get_settings
+from ..config.llm import get_structured_llm
 from ..models.llm_outputs import DiagnosisOutput
 from ..services.graphrag_service import get_graphrag_service
 
@@ -74,13 +73,7 @@ def diagnosis_agent(state) -> dict:
             logger.warning("diagnosis_agent.graphrag_fallback", error=str(e))
 
     # ---- Step 2: LLM 推理 ----
-    settings = get_settings()
-    llm = ChatOpenAI(
-        model=settings.openai_model,
-        api_key=settings.openai_api_key,
-        temperature=0.2,
-    )
-    structured_llm = llm.with_structured_output(DiagnosisOutput)
+    structured_llm = get_structured_llm(DiagnosisOutput, temperature=0.2)
 
     patient_summary = json.dumps(patient_info, indent=2, ensure_ascii=False)
 

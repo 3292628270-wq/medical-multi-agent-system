@@ -9,9 +9,9 @@
 | P0-3 | 诊断循环上限 | P0 | ✅ 已完成 | 2026-04-28 |
 | P0-2 | LLM 结构化输出 | P0 | ✅ 已完成 | 2026-04-28 |
 | P0-1 | Service 层与 Agent 集成 | P0 | ✅ 已完成 | 2026-04-28 |
-| P1-1 | LLM 单例 + Prompt Caching | P1 | ⬜ 待开始 | - |
-| P1-2 | SSE 流式输出 | P1 | ⬜ 待开始 | - |
-| P1-3 | Agent/Pipeline 测试 | P1 | ⬜ 待开始 | - |
+| P1-1 | LLM 单例 + Prompt Caching | P1 | ✅ 已完成 | 2026-04-28 |
+| P1-2 | SSE 流式输出 | P1 | ✅ 已完成 | 2026-04-28 |
+| P1-3 | Agent/Pipeline 测试 | P1 | ✅ 已完成 | 2026-04-28 |
 | P2-1 | 持久化 Checkpointer | P2 | ⬜ 待开始 | - |
 | P2-2 | 知识库扩展 | P2 | ⬜ 待开始 | - |
 | P2-3 | 输入安全防护 | P2 | ⬜ 待开始 | - |
@@ -209,7 +209,7 @@ def intake_agent(state) -> dict:
 
 ## 三、P1（应该尽快做 — 影响系统可用性和开发效率）
 
-### P1-1：LLM 单例 + Prompt Caching + 连接复用
+### P1-1：LLM 单例 + Prompt Caching + 连接复用 ✅ 已完成 (2026-04-28)
 
 **现状**：5 个智能体各自独立创建 `ChatOpenAI(...)` 实例。每次调用重新发送相同的 system prompt（最长约 1000 token）。
 
@@ -251,7 +251,7 @@ llm = get_llm(temperature=0.1)  # 或者结构化版本，也统一创建
 
 ---
 
-### P1-2：流式输出（SSE）
+### P1-2：流式输出（SSE） ✅ 已完成 (2026-04-28)
 
 **现状**：`pipeline.invoke()` 同步执行完毕才返回完整 `AnalyzeResponse`。用户等待 15-30 秒看到的是白屏/loading。
 
@@ -299,7 +299,7 @@ eventSource.onmessage = (e) => {
 
 ---
 
-### P1-3：Agent 层与管线层测试
+### P1-3：Agent 层与管线层测试 ✅ 已完成 (2026-04-28)
 
 **现状**：29 个测试全部针对 Service 层。Agent 和 Pipeline 没有任何测试。
 

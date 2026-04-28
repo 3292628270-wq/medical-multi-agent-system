@@ -8,6 +8,7 @@ class Settings(BaseSettings):
     # LLM
     openai_api_key: str = ""
     openai_model: str = "gpt-4o-mini"
+    openai_base_url: str = ""  # DeepSeek 等兼容 API 的自定义地址
 
     # PostgreSQL
     postgres_host: str = "localhost"
