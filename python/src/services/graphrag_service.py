@@ -220,33 +220,69 @@ class GraphRAGService:
 
     # ---- 核心查询方法 ----
 
+    def _get_disease_symptom_set(self, disease: str, top_n: int = 15) -> set[str]:
+        """获取疾病的 top-N 核心症状（排除罕见症状噪音）。"""
+        rels = self.get_disease_relations(disease, ["symptom"])
+        return set(rels.get("symptom", [])[:top_n])
+
     def find_diseases_by_symptoms(self, symptoms: list[str]) -> list[dict]:
         """
-        根据症状列表检索候选疾病，按匹配症状数排序。
+        根据症状列表检索候选疾病，按 **Jaccard 相似度** 排序。
 
-        KG 模式：查询 symptom_disease 倒排索引
-        回退模式：内存字典投票计数
+        Jaccard = |患者症状 ∩ 疾病典型症状| / |患者症状 ∪ 疾病典型症状|
         """
         results = []
+        patient_symptoms = set(symptoms)
 
         if self._kg_available and symptoms:
             try:
+                # 先查 symptom_disease 倒排索引，获取候选疾病
                 placeholders = ",".join("?" for _ in symptoms)
                 rows = self._kg_conn.execute(
                     f"""SELECT disease, SUM(frequency) as total_freq
                         FROM symptom_disease
                         WHERE symptom IN ({placeholders})
                         GROUP BY disease
+                        HAVING total_freq >= 2
                         ORDER BY total_freq DESC
-                        LIMIT 30""",
+                        LIMIT 50""",
                     symptoms,
                 ).fetchall()
 
+                scored = []
                 for row in rows:
-                    icd = _DISEASE_ICD10_FALLBACK.get(row["disease"], {})
-                    results.append({
+                    disease_symptoms = self._get_disease_symptom_set(row["disease"])
+                    if not disease_symptoms:
+                        continue
+                    # Jaccard 相似度
+                    intersection = patient_symptoms & disease_symptoms
+                    union = patient_symptoms | disease_symptoms
+                    jaccard = len(intersection) / len(union) if union else 0
+                    # TF-IDF 加权：罕见症状命中加分
+                    rarity_bonus = sum(
+                        1.0 / max(self._get_symptom_freq(s), 1)
+                        for s in intersection
+                    )
+                    scored.append({
                         "disease": row["disease"],
-                        "symptom_match_count": row["total_freq"],
+                        "jaccard": round(jaccard, 4),
+                        "matched_symptoms": sorted(intersection),
+                        "total_freq": row["total_freq"],
+                        "rarity_score": round(rarity_bonus, 4),
+                    })
+
+                # 综合排序：Jaccard (70%) + 稀有症状加分 (30%)
+                for s in scored:
+                    s["score"] = round(s["jaccard"] * 0.7 + s["rarity_score"] * 0.05, 4)
+                scored.sort(key=lambda x: x["score"], reverse=True)
+
+                for s in scored[:30]:
+                    icd = _DISEASE_ICD10_FALLBACK.get(s["disease"], {})
+                    results.append({
+                        "disease": s["disease"],
+                        "score": s["score"],
+                        "jaccard": s["jaccard"],
+                        "matched_symptoms": s["matched_symptoms"],
                         "icd10_code": icd.get("code", ""),
                         "icd10_description": icd.get("desc", ""),
                     })
@@ -255,29 +291,109 @@ class GraphRAGService:
             except Exception as e:
                 logger.warning("cmeie_kg.query_failed", error=str(e))
 
-        # 回退：内存字典
-        disease_scores: dict[str, float] = {}
+        # 回退：内存字典 Jaccard
+        disease_symptom_sets: dict[str, set[str]] = {}
         for symptom in symptoms:
-            if symptom in _SYMPTOM_DISEASE_FALLBACK:
-                for d in _SYMPTOM_DISEASE_FALLBACK[symptom]:
-                    disease_scores[d] = disease_scores.get(d, 0) + 1
-            # 模糊匹配
-            else:
-                for map_key in _SYMPTOM_DISEASE_FALLBACK:
-                    if symptom in map_key or map_key in symptom:
-                        for d in _SYMPTOM_DISEASE_FALLBACK[map_key]:
-                            disease_scores[d] = disease_scores.get(d, 0) + 0.5
+            for disease in _SYMPTOM_DISEASE_FALLBACK.get(symptom, []):
+                if disease not in disease_symptom_sets:
+                    disease_symptom_sets[disease] = set(_SYMPTOM_DISEASE_FALLBACK.get(disease, []))
+                # else: already built
 
-        ranked = sorted(disease_scores.items(), key=lambda x: x[1], reverse=True)
-        for disease, score in ranked:
-            icd = _DISEASE_ICD10_FALLBACK.get(disease, {})
+        scored = []
+        for disease, d_symptoms in disease_symptom_sets.items():
+            intersection = patient_symptoms & d_symptoms
+            union = patient_symptoms | d_symptoms
+            jaccard = len(intersection) / len(union) if union else 0
+            if jaccard > 0:
+                scored.append({"disease": disease, "jaccard": jaccard})
+
+        scored.sort(key=lambda x: x["jaccard"], reverse=True)
+        for s in scored:
+            icd = _DISEASE_ICD10_FALLBACK.get(s["disease"], {})
             results.append({
-                "disease": disease,
-                "symptom_match_count": score,
+                "disease": s["disease"],
+                "score": s["jaccard"],
+                "jaccard": s["jaccard"],
+                "matched_symptoms": [],
                 "icd10_code": icd.get("code", ""),
                 "icd10_description": icd.get("desc", ""),
             })
         return results
+
+    def _get_symptom_freq(self, symptom: str) -> int:
+        """获取症状在 KG 中的总出现次数（用于 TF-IDF 稀有度计算）。"""
+        if not self._kg_available:
+            return 1
+        row = self._kg_conn.execute(
+            "SELECT SUM(frequency) FROM symptom_disease WHERE symptom = ?",
+            (symptom,),
+        ).fetchone()
+        return row[0] or 1
+
+    def _get_disease_top_symptoms(self, disease: str, top_n: int = 12) -> set[str]:
+        """获取疾病的 top-N 核心症状（按频次排序，避免罕见症状稀释匹配率）。"""
+        rels = self.get_disease_relations(disease, ["symptom"])
+        return set(rels.get("symptom", [])[:top_n])
+
+    def calc_evidence_score(
+        self,
+        disease_name: str,
+        patient_symptoms: list[str],
+        patient_labs: list[str] | None = None,
+    ) -> dict:
+        """
+        基于诊断标准匹配率，计算确定性置信度。
+
+        对于给定疾病 D：
+          - D 的 top-N 核心症状集合 S_d（频次最高的 N 个，通常12个）
+          - 患者的症状集合 S_p
+          - 症状匹配率 = |S_p ∩ S_d| / |S_d|
+
+        返回:
+          {
+            "evidence_score": 0.0-1.0,
+            "symptom_match_rate": 0.0-1.0,
+            "lab_match_rate": 0.0-1.0 或 None,
+            "matched_symptoms": [...],
+            "unmatched_core_symptoms": [...],
+            "recommended_tests": [...],
+          }
+        """
+        patient_set = set(patient_symptoms)
+        lab_set = set(patient_labs or [])
+
+        # 只用 core symptoms (top 12)，不用全部 26 种
+        core_symptoms = self._get_disease_top_symptoms(disease_name, top_n=12)
+        disease_labs = set(self.get_disease_tests(disease_name, top_n=10))
+
+        # 症状匹配率
+        matched_symptoms = patient_set & core_symptoms
+        unmatched = core_symptoms - patient_set
+        symptom_rate = (
+            len(matched_symptoms) / len(core_symptoms)
+            if core_symptoms else 0
+        )
+
+        # 实验室检查匹配率
+        matched_labs = lab_set & disease_labs
+        lab_rate = (
+            len(matched_labs) / len(disease_labs) if disease_labs else None
+        )
+
+        # 综合证据得分 = 症状匹配率 (权重60%) + 实验室匹配率 (权重40%)
+        evidence = symptom_rate * 0.6
+        if lab_rate is not None and disease_labs:
+            evidence += lab_rate * 0.4
+        evidence = round(min(evidence, 1.0), 4)
+
+        return {
+            "evidence_score": evidence,
+            "symptom_match_rate": round(symptom_rate, 4),
+            "lab_match_rate": round(lab_rate, 4) if lab_rate is not None else None,
+            "matched_symptoms": sorted(matched_symptoms),
+            "unmatched_core_symptoms": sorted(unmatched),
+            "recommended_tests_from_kg": sorted(disease_labs - lab_set)[:10],
+        }
 
     def get_disease_relations(
         self, disease_name: str, relation_types: list[str] | None = None

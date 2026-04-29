@@ -128,6 +128,35 @@ def diagnosis_agent(state) -> dict:
         diagnosis_data = output.model_dump(mode="json")
         needs_more = diagnosis_data.pop("needs_more_info", False)
 
+        # ---- Step 3: 诊断标准匹配 — 确定性置信度 ----
+        primary_disease = diagnosis_data.get("primary_diagnosis", {}).get("disease_name", "")
+        if primary_disease and symptoms:
+            try:
+                rag = get_graphrag_service()
+                # 提取患者的实验室检查名称
+                patient_labs = [
+                    lab.get("test_name", "") for lab in
+                    patient_info.get("lab_results", []) or []
+                    if isinstance(lab, dict)
+                ]
+                evidence = rag.calc_evidence_score(
+                    primary_disease, symptoms, patient_labs,
+                )
+                # 用确定性证据得分覆盖 LLM 编的置信度
+                diagnosis_data["primary_diagnosis"]["confidence"] = max(
+                    evidence["evidence_score"],
+                    diagnosis_data["primary_diagnosis"].get("confidence", 0),
+                )
+                diagnosis_data["_evidence"] = evidence
+                logger.info(
+                    "diagnosis_agent.evidence_scored",
+                    disease=primary_disease,
+                    evidence_score=evidence["evidence_score"],
+                    matched=evidence["matched_symptoms"],
+                )
+            except Exception as e:
+                logger.warning("diagnosis_agent.evidence_fallback", error=str(e))
+
         logger.info(
             "diagnosis_agent.success",
             primary=diagnosis_data.get("primary_diagnosis", {}).get("disease_name"),
