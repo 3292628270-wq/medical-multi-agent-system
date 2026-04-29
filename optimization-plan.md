@@ -71,12 +71,12 @@ POST /api/v1/clinical/analyze         POST /api/v1/clinical/analyze/stream
    Intake ──(structured_output→IntakeOutput)──▶ patient_info
         │
         ▼
- Diagnosis ──(知识库检索→LLM推理)──▶ diagnosis + needs_more_info
+ Diagnosis ──(KG Jaccard召回→LLM推理→证据评分)──▶ diagnosis + needs_more_info
         │                                      │
         │   回退循环（上限3次）                  │
         │                                      │
         ▼                                      │
- Treatment ──(LLM→DDI确定性检查→合并)──▶ treatment_plan
+ Treatment ──(LLM→DDI检查→KG药物推荐)──▶ treatment_plan
         │
         ▼
   Coding ──(LLM→ICD-10 SQLite校验)──▶ coding_result
@@ -193,7 +193,7 @@ patient_dict = output.model_dump(mode="json")
 | **ICD-10 编码** | 30 条硬编码 dict | CMS 2026 XML → SQLite，36,343 条可计费编码，LIKE 模糊搜索含相关性排序 |
 | **DDI 数据库** | 10 条英文条目 | 85+ 条，全部中文药物名，覆盖抗生素/心血管/降糖/精神科/抗凝/NSAID 6 大类 |
 | **药物类别映射** | 14 个英文映射 | 108 个中英文药物名→类别标识符映射 |
-| **症状-疾病知识库** | 11 种英文症状 | 50+ 种中文症状，每症状对应 5-15 个候选疾病，支持模糊匹配 |
+| **症状-疾病知识库** | 11 种英文症状 | P2-5 升级为 CMeIE 知识图谱（3,621 疾病 × 6,384 症状），Jaccard 检索排序 |
 | **疾病-ICD10映射** | 15 条英文疾病→编码 | 200+ 条中英文疾病→ICD-10 编码，覆盖 22 个 ICD-10 章节 |
 | **过敏检查** | 简单字符串匹配 | 青霉素交叉反应（头孢类~10%）、磺胺过敏识别 |
 
@@ -264,6 +264,44 @@ def _validate_input(patient_description: str) -> None:
 ```
 
 **改动文件**：`routes.py`（+`_validate_input()` + 同步/流式两个端点调用）
+
+---
+
+### P2-5：CMeIE 医学知识图谱 ✅ 已完成 (2026-04-29)
+
+| 维度 | 改造前 | 改造后 |
+|------|--------|--------|
+| **数据源** | 手写 Python dict（50症状→200疾病） | CMeIE 训练集解析（14,339条标注，36,892有效三元组） |
+| **疾病覆盖** | 200 种 | 3,621 种 |
+| **症状覆盖** | 50 种 | 6,384 种 |
+| **药物关系** | 无（DDI 独立维护） | 2,056 种药物 × 4,570 条三元组 |
+| **检查关系** | 无 | 实验室检查 1,852 条 + 影像学 1,439 条 |
+| **存储** | 内存 dict | SQLite（`data/cmeie_kg.db`） + 内存回退 |
+| **召回排序** | 频次累加 | **Jaccard 相似度** = \|患者症状 ∩ 疾病top15核心症状\| / \|患者症状 ∪ 疾病top15核心症状\| |
+| **置信度** | LLM 主观编造 | **诊断标准匹配** = 症状匹配率×0.6 + 实验室匹配率×0.4，取 max(LLM, evidence) |
+| **诊断上下文** | 仅返回候选疾病列表 | top-3 候选的完整关系（症状/药物/检查/鉴别诊断/并发症）注入 prompt |
+
+**诊断流程**：
+```
+Step 1: KG 召回 (Jaccard)
+  患者症状 → SQL 查 symptom_disease 倒排索引 → 候选疾病
+  → 对每个候选算 Jaccard = |S_p ∩ S_d| / |S_p ∪ S_d|
+  → 按 Jaccard×0.7 + 稀有症状加分×0.05 排序 → top 30
+
+Step 2: LLM 推理
+  Prompt = 患者数据 + top-3 KG 候选（含症状/药物/检查/鉴别/并发症）
+  → LLM 输出: primary_diagnosis + differential_list
+
+Step 3: 诊断标准匹配 (确定置信度)
+  疾病核心症状12个, 患者命中N个 → 症状匹配率 N/12
+  实验室检查匹配率 M/10
+  综合方案得分 = 症状率×0.6 + 实验室率×0.4
+  最终置信度 = max(LLM置信度, evidence_score)
+```
+
+**新增能力**：`get_disease_symptoms()` / `get_disease_drugs()` / `get_disease_tests()` / `get_differential_diagnosis()` / `get_complications()` / `calc_evidence_score()`
+
+**改动文件**：`graphrag_service.py`（完全重写 KG 后端）、`diagnosis_agent.py`（+证据评分覆盖置信度）、`treatment_agent.py`（+KG 药物推荐）、新增 `scripts/import_cmeie_kg.py`
 
 ---
 
