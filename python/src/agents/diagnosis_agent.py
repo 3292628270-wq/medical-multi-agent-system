@@ -55,7 +55,7 @@ def diagnosis_agent(state) -> dict:
             "errors": state.errors + ["No patient info available for diagnosis"],
         }
 
-    # ---- Step 1: GraphRAG 确定性检索 ----
+    # ---- Step 1: 知识图谱检索 ----
     # 容错：症状可能是 dict(name=...) 或纯字符串
     raw_symptoms = patient_info.get("symptoms", []) or []
     symptoms = []
@@ -68,20 +68,40 @@ def diagnosis_agent(state) -> dict:
             name = ""
         if name:
             symptoms.append(name)
-    chief = patient_info.get("chief_complaint", "")
+
     rag_context = ""
     if symptoms:
         try:
             rag = get_graphrag_service()
             candidates = rag.find_diseases_by_symptoms(symptoms)
+
+            # 对 top-3 候选疾病获取详细信息
+            enrich = []
+            for c in candidates[:3]:
+                disease = c["disease"]
+                info = {
+                    "disease": disease,
+                    "match_score": c["symptom_match_count"],
+                    "icd10": c["icd10_code"],
+                    "typical_symptoms": rag.get_disease_symptoms(disease, top_n=8),
+                    "common_drugs": rag.get_disease_drugs(disease, top_n=5),
+                    "related_tests": rag.get_disease_tests(disease, top_n=5),
+                    "differential": rag.get_differential_diagnosis(disease, top_n=5),
+                    "complications": rag.get_complications(disease, top_n=5),
+                }
+                enrich.append(info)
+
             rag_context = json.dumps(
-                {"匹配症状": symptoms, "知识图谱候选疾病": candidates},
+                {
+                    "匹配症状": symptoms,
+                    "知识图谱候选疾病（含详细信息）": enrich,
+                },
                 indent=2,
                 ensure_ascii=False,
             )
-            logger.info("diagnosis_agent.graphrag_hits", count=len(candidates))
+            logger.info("diagnosis_agent.kg_hits", count=len(candidates))
         except Exception as e:
-            logger.warning("diagnosis_agent.graphrag_fallback", error=str(e))
+            logger.warning("diagnosis_agent.kg_fallback", error=str(e))
 
     # ---- Step 2: LLM 推理 ----
     structured_llm = get_structured_llm(DiagnosisOutput, temperature=0.2)

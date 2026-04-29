@@ -16,6 +16,7 @@ from langchain_core.messages import HumanMessage, SystemMessage
 from ..config.llm import get_structured_llm
 from ..models.llm_outputs import TreatmentOutput
 from ..services.drug_interaction import check_interactions, check_allergy_contraindication
+from ..services.graphrag_service import get_graphrag_service
 
 logger = structlog.get_logger(__name__)
 
@@ -73,7 +74,28 @@ def treatment_agent(state) -> dict:
         elif isinstance(a, str):
             allergies.append(a)
 
-    # ---- Step 2: LLM 推理 ----
+    # ---- Step 2: 知识图谱药物推荐 ----
+    kg_drug_context = ""
+    try:
+        primary_dx = diagnosis.get("primary_diagnosis", {})
+        disease_name = primary_dx.get("disease_name", "")
+        if disease_name:
+            rag = get_graphrag_service()
+            kg_drugs = rag.get_disease_drugs(disease_name, top_n=10)
+            kg_tests = rag.get_disease_tests(disease_name, top_n=5)
+            if kg_drugs or kg_tests:
+                kg_drug_context = json.dumps(
+                    {
+                        "知识图谱推荐药物（仅供参考）": kg_drugs,
+                        "知识图谱推荐检查": kg_tests,
+                    },
+                    indent=2,
+                    ensure_ascii=False,
+                )
+    except Exception as e:
+        logger.warning("treatment_agent.kg_fallback", error=str(e))
+
+    # ---- Step 3: LLM 推理 ----
     structured_llm = get_structured_llm(TreatmentOutput, temperature=0.2)
 
     context = json.dumps(
@@ -81,6 +103,9 @@ def treatment_agent(state) -> dict:
         indent=2,
         ensure_ascii=False,
     )
+
+    if kg_drug_context:
+        context += "\n\n" + kg_drug_context
 
     messages = [
         SystemMessage(content=TREATMENT_SYSTEM_PROMPT),

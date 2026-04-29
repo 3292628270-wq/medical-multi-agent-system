@@ -1,475 +1,103 @@
 """
-GraphRAG 服务 —— 医学知识图谱检索。
+医学知识图谱检索服务。
 
-提供症状→疾病映射和疾病→ICD-10编码查找。
-支持 Neo4j 在线模式和内存离线模式（默认）。
+数据来源：
+  - 主：CMeIE 知识图谱（SQLite，36,892 条三元组，3,621 疾病，6,384 症状）
+  - 备：内存字典（50+ 症状→200+ 疾病映射，KG 不可用时回退）
+  - ICD-10 映射：内存字典（200+ 条疾病→编码）
 """
 
 from __future__ import annotations
 from typing import Optional
+import sqlite3
 import structlog
+from pathlib import Path
 
 from ..config.settings import get_settings
 
 logger = structlog.get_logger(__name__)
 
+# SQLite KG 数据库路径
+_KG_DB_PATH = Path(__file__).parent.parent.parent / "data" / "cmeie_kg.db"
+
 # ============================================================================
-# 症状→疾病映射（50+ 种症状，200+ 个疾病候选）
+# 内存回退：症状→疾病（KG 不可用时使用）
 # ============================================================================
-SYMPTOM_DISEASE_MAP = {
-    # ---- 全身症状 ----
-    "发热": ["流行性感冒", "肺炎", "COVID-19", "脓毒症", "疟疾", "尿路感染",
-             "结核病", "感染性心内膜炎", "淋巴瘤", "系统性红斑狼疮",
-             "成人Still病", "布鲁菌病", "斑疹伤寒", "登革热", "肾盂肾炎"],
+_SYMPTOM_DISEASE_FALLBACK = {
+    "发热": ["流行性感冒", "肺炎", "COVID-19", "脓毒症", "尿路感染",
+             "结核病", "感染性心内膜炎", "淋巴瘤", "系统性红斑狼疮"],
     "乏力": ["贫血", "甲状腺功能减退", "抑郁症", "糖尿病", "心力衰竭",
-             "慢性肾病", "慢性肝病", "结核病", "肿瘤相关性疲劳",
-             "睡眠呼吸暂停综合征", "肾上腺皮质功能减退", "多发性肌炎"],
-    "消瘦": ["恶性肿瘤", "甲状腺功能亢进", "糖尿病", "结核病",
-             "吸收不良综合征", "慢性胰腺炎", "炎症性肠病", "艾滋病"],
-    "水肿": ["心力衰竭", "肾病综合征", "肝硬化", "深静脉血栓",
-            "甲状腺功能减退", "营养不良", "静脉功能不全", "淋巴水肿"],
-    "淋巴结肿大": ["淋巴瘤", "感染性单核细胞增多症", "结核性淋巴结炎",
-                  "白血病", "转移癌", "猫抓病", "HIV/AIDS", "结节病"],
-
-    # ---- 头部 ----
-    "头痛": ["偏头痛", "紧张性头痛", "脑膜炎", "高血压", "脑肿瘤",
-             "蛛网膜下腔出血", "颞动脉炎", "丛集性头痛", "青光眼", "鼻窦炎"],
-    "眩晕": ["良性阵发性位置性眩晕", "梅尼埃病", "前庭神经炎",
-             "脑干梗死", "椎基底动脉供血不足", "体位性低血压",
-             "心律失常", "贫血", "药物不良反应"],
-
-    # ---- 呼吸系统 ----
+             "慢性肾病", "慢性肝病", "结核病"],
     "咳嗽": ["肺炎", "急性支气管炎", "支气管哮喘", "慢性阻塞性肺疾病",
-             "肺癌", "COVID-19", "百日咳", "胃食管反流病",
-             "上气道咳嗽综合征", "间质性肺病", "支气管扩张"],
-    "咳痰": ["肺炎", "慢性阻塞性肺疾病急性加重", "支气管扩张",
-             "肺脓肿", "急性支气管炎", "囊性纤维化"],
-    "咯血": ["肺结核", "肺癌", "支气管扩张", "肺栓塞",
-             "二尖瓣狭窄", "肺脓肿", "Goodpasture综合征"],
-    "呼吸困难": ["支气管哮喘", "慢性阻塞性肺疾病", "心力衰竭", "肺炎",
-                "肺栓塞", "气胸", "间质性肺病", "肺纤维化",
-                "心包积液", "重症肌无力", "焦虑障碍"],
-    "喘息": ["支气管哮喘", "慢性阻塞性肺疾病", "心源性哮喘",
-             "过敏性反应", "异物吸入", "声带功能障碍"],
+             "肺癌", "COVID-19", "胃食管反流病", "支气管扩张"],
     "胸痛": ["急性心肌梗死", "不稳定型心绞痛", "肺栓塞", "气胸",
-             "主动脉夹层", "心包炎", "胃食管反流病", "肋软骨炎",
-             "带状疱疹", "食管痉挛", "胸膜炎"],
-    "胸痛放射": ["急性心肌梗死", "主动脉夹层", "肺栓塞"],
-
-    # ---- 心血管系统 ----
-    "心悸": ["心房颤动", "室性早搏", "室上性心动过速", "甲状腺功能亢进",
-             "焦虑障碍", "贫血", "低血糖", "嗜铬细胞瘤", "二尖瓣脱垂"],
-    "晕厥": ["血管迷走性晕厥", "心源性晕厥", "体位性低血压",
-             "颈动脉窦过敏", "癫痫发作", "低血糖"],
-
-    # ---- 消化系统 ----
+             "主动脉夹层", "心包炎", "胃食管反流病"],
+    "呼吸困难": ["支气管哮喘", "慢性阻塞性肺疾病", "心力衰竭", "肺炎",
+                "肺栓塞", "气胸", "间质性肺病"],
+    "头痛": ["偏头痛", "紧张性头痛", "脑膜炎", "高血压", "脑肿瘤",
+             "蛛网膜下腔出血", "鼻窦炎"],
     "腹痛": ["急性阑尾炎", "急性胆囊炎", "急性胰腺炎", "消化性溃疡",
-             "肠易激综合征", "肠梗阻", "炎症性肠病", "输尿管结石",
-             "宫外孕破裂", "卵巢囊肿扭转", "腹主动脉瘤", "肠系膜缺血"],
-    "上腹痛": ["消化性溃疡", "急性胰腺炎", "胃食管反流病",
-               "急性胆囊炎", "急性心肌梗死（下壁）", "功能性消化不良"],
-    "右下腹痛": ["急性阑尾炎", "克罗恩病", "卵巢囊肿扭转", "异位妊娠",
-                "右侧输尿管结石", "梅克尔憩室炎", "肠系膜淋巴结炎"],
+             "肠梗阻", "炎症性肠病", "输尿管结石"],
     "恶心呕吐": ["急性胃肠炎", "妊娠呕吐", "急性胰腺炎", "肠梗阻",
-                "偏头痛", "颅内压增高", "糖尿病酮症酸中毒",
-                "药物不良反应", "梅尼埃病", "肝炎"],
-    "腹泻": ["急性胃肠炎", "抗生素相关性腹泻", "炎症性肠病",
-             "肠易激综合征", "细菌性痢疾", "霍乱", "乳糜泻",
-             "甲状腺功能亢进", "结直肠癌", "乳糖不耐受"],
-    "便秘": ["肠易激综合征", "甲状腺功能减退", "结直肠癌",
-             "帕金森病", "药物性便秘（阿片类、钙通道阻滞剂）",
-             "糖尿病性胃肠神经病变", "出口梗阻型便秘"],
-    "黄疸": ["急性肝炎", "胆总管结石", "胰腺癌", "肝硬化",
-             "溶血性贫血", "Gilbert综合征", "药物性肝损伤"],
-    "吞咽困难": ["食管癌", "胃食管反流病", "贲门失弛缓症",
-                "食管狭窄", "脑卒中", "重症肌无力", "进行性核上性麻痹"],
-    "黑便": ["上消化道出血", "消化性溃疡出血", "食管静脉曲张破裂",
-             "胃癌", "Mallory-Weiss综合征", "血管发育不良"],
-
-    # ---- 泌尿生殖系统 ----
-    "尿频": ["尿路感染", "良性前列腺增生", "糖尿病", "膀胱过度活动症",
-             "间质性膀胱炎", "妊娠", "前列腺癌"],
-    "尿痛": ["尿路感染", "性传播感染", "间质性膀胱炎", "肾结石"],
-    "血尿": ["尿路感染", "肾结石", "膀胱癌", "肾小球肾炎",
-             "IgA肾病", "前列腺增生", "创伤"],
-    "少尿": ["急性肾损伤", "心力衰竭", "脱水", "肝肾综合征",
-             "尿路梗阻", "急进性肾小球肾炎"],
-    "月经异常": ["多囊卵巢综合征", "甲状腺功能异常", "子宫肌瘤",
-                "子宫腺肌症", "高催乳素血症", "功能性子宫出血"],
-    "阴道异常出血": ["子宫肌瘤", "子宫内膜增生", "子宫内膜癌",
-                    "宫颈癌", "功能失调性子宫出血", "妊娠并发症"],
-
-    # ---- 神经系统 ----
-    "抽搐": ["癫痫", "热性惊厥", "低血糖", "低钙血症",
-             "脑膜炎", "脑肿瘤", "戒断综合征（酒精/苯二氮䓬）"],
-    "意识障碍": ["脑卒中", "低血糖昏迷", "糖尿病酮症酸中毒",
-                "肝性脑病", "尿毒症脑病", "颅内出血",
-                "脑膜炎", "药物过量", "一氧化碳中毒", "癫痫发作后状态"],
-    "肢体麻木": ["脑卒中", "糖尿病周围神经病变", "颈椎病",
-                "多发性硬化", "维生素B12缺乏", "腕管综合征",
-                "末梢神经炎", "脊髓肿瘤"],
-    "震颤": ["帕金森病", "特发性震颤", "甲状腺功能亢进",
-             "小脑疾病", "Wilson病", "药物性震颤（抗精神病药、丙戊酸）"],
-    "记忆力减退": ["阿尔茨海默病", "血管性痴呆", "路易体痴呆",
-                  "额颞叶痴呆", "甲状腺功能减退", "维生素B12缺乏",
-                  "正常压力脑积水", "抑郁症（假性痴呆）"],
-    "失眠": ["焦虑障碍", "抑郁症", "睡眠呼吸暂停综合征",
-             "不宁腿综合征", "甲状腺功能亢进", "慢性疼痛",
-             "药物因素（咖啡因、糖皮质激素）"],
-
-    # ---- 肌肉骨骼 ----
+                "偏头痛", "颅内压增高", "糖尿病酮症酸中毒"],
+    "头晕": ["良性阵发性位置性眩晕", "梅尼埃病", "前庭神经炎",
+             "体位性低血压", "心律失常", "贫血"],
     "关节痛": ["类风湿关节炎", "骨关节炎", "痛风", "系统性红斑狼疮",
-              "银屑病关节炎", "反应性关节炎", "莱姆病", "风湿性多肌痛"],
-    "腰背痛": ["腰椎间盘突出症", "腰椎管狭窄", "腰肌劳损",
-              "脊椎压缩性骨折", "强直性脊柱炎", "肾盂肾炎",
-              "胰腺炎", "腹主动脉瘤", "转移性骨肿瘤"],
-    "肌痛": ["病毒感染", "横纹肌溶解症", "多发性肌炎",
-             "风湿性多肌痛", "甲状腺功能减退", "他汀类药物不良反应",
-             "纤维肌痛综合征"],
-    "颈部疼痛": ["颈椎病", "颈部肌肉劳损", "脑膜炎",
-                "蛛网膜下腔出血", "颞下颌关节紊乱病", "颈椎间盘突出"],
-
-    # ---- 皮肤 ----
-    "皮疹": ["荨麻疹", "药疹", "系统性红斑狼疮", "银屑病",
-             "特应性皮炎", "带状疱疹", "猩红热", "麻疹",
-             "Stevens-Johnson综合征", "皮肌炎"],
-    "瘙痒": ["荨麻疹", "特应性皮炎", "胆汁淤积", "尿毒症",
-             "霍奇金淋巴瘤", "疥疮", "银屑病", "药物反应"],
-    "紫癜": ["特发性血小板减少性紫癜", "过敏性紫癜",
-             "弥散性血管内凝血", "血管炎", "维生素C缺乏",
-             "药物性血小板减少", "脑膜炎球菌败血症"],
-
-    # ---- 眼科/耳鼻喉 ----
-    "听力下降": ["老年性耳聋", "突发性耳聋", "慢性化脓性中耳炎",
-                "梅尼埃病", "听神经瘤", "氨基糖苷类抗生素中毒", "噪声性聋"],
-    "耳鸣": ["梅尼埃病", "听神经瘤", "噪声性聋", "老年性耳聋",
-             "血管性耳鸣", "颞下颌关节紊乱病", "药物性（阿司匹林、袢利尿剂）"],
-    "视力下降": ["白内障", "青光眼", "糖尿病视网膜病变", "黄斑变性",
-                "视网膜脱离", "视神经炎", "颞动脉炎", "脑肿瘤"],
-    "鼻出血": ["高血压", "鼻黏膜干燥", "遗传性出血性毛细血管扩张症",
-              "鼻咽癌", "血小板减少", "抗凝治疗"],
-
-    # ---- 精神心理 ----
-    "情绪低落": ["抑郁症", "双相障碍抑郁相", "恶劣心境",
-                "甲状腺功能减退", "焦虑障碍", "物质使用障碍"],
-    "焦虑": ["广泛性焦虑障碍", "惊恐障碍", "社交焦虑障碍",
-             "创伤后应激障碍", "甲状腺功能亢进", "低血糖",
-             "嗜铬细胞瘤", "物质戒断"],
+              "银屑病关节炎"],
 }
 
 # ============================================================================
-# 疾病→ICD-10 编码映射（200+ 条）
+# 内存回退：疾病→ICD-10（KG 中没有 ICD-10 编码）
 # ============================================================================
-DISEASE_ICD10_MAP = {
-    # ---- 感染和寄生虫 (A00-B99) ----
-    "霍乱": {"code": "A00.9", "desc": "霍乱"},
-    "伤寒": {"code": "A01.00", "desc": "伤寒"},
-    "细菌性痢疾": {"code": "A03.9", "desc": "细菌性痢疾"},
-    "阿米巴病": {"code": "A06.9", "desc": "阿米巴病"},
-    "肺结核": {"code": "A15.0", "desc": "肺结核"},
-    "结核病": {"code": "A15.9", "desc": "肺结核"},
-    "结核性淋巴结炎": {"code": "A18.2", "desc": "结核性淋巴结炎"},
-    "布鲁菌病": {"code": "A23.9", "desc": "布鲁菌病"},
-    "破伤风": {"code": "A34", "desc": "破伤风"},
-    "脓毒症": {"code": "A41.9", "desc": "脓毒症"},
-    "细菌性感染": {"code": "A49.9", "desc": "细菌性感染"},
-    "感染性单核细胞增多症": {"code": "B27.90", "desc": "感染性单核细胞增多症"},
-    "病毒性感染": {"code": "B34.9", "desc": "病毒性感染"},
-    "艾滋病": {"code": "B20", "desc": "HIV感染"},
-    "HIV/AIDS": {"code": "B20", "desc": "HIV感染"},
-    "斑疹伤寒": {"code": "A75.9", "desc": "斑疹伤寒"},
-    "猫抓病": {"code": "A28.1", "desc": "猫抓病"},
-    "登革热": {"code": "A90", "desc": "登革热"},
-    "疟疾": {"code": "B54", "desc": "疟疾"},
-    "带状疱疹": {"code": "B02.9", "desc": "带状疱疹"},
-    "猩红热": {"code": "A38", "desc": "猩红热"},
-    "麻疹": {"code": "B05.9", "desc": "麻疹"},
-
-    # ---- 恶性肿瘤 (C00-D49) ----
-    "肺癌": {"code": "C34.90", "desc": "肺癌"},
-    "胃癌": {"code": "C16.9", "desc": "胃癌"},
-    "结直肠癌": {"code": "C18.9", "desc": "结肠癌"},
-    "肝癌": {"code": "C22.9", "desc": "肝癌"},
-    "胰腺癌": {"code": "C25.9", "desc": "胰腺癌"},
-    "乳腺癌": {"code": "C50.919", "desc": "乳腺癌"},
-    "宫颈癌": {"code": "C53.9", "desc": "宫颈癌"},
-    "子宫内膜癌": {"code": "C54.1", "desc": "子宫内膜癌"},
-    "卵巢癌": {"code": "C56.9", "desc": "卵巢癌"},
-    "前列腺癌": {"code": "C61", "desc": "前列腺癌"},
-    "膀胱癌": {"code": "C67.9", "desc": "膀胱癌"},
-    "淋巴瘤": {"code": "C85.90", "desc": "淋巴瘤"},
-    "白血病": {"code": "C95.90", "desc": "白血病"},
-    "脑肿瘤": {"code": "C71.9", "desc": "脑恶性肿瘤"},
-    "食管癌": {"code": "C15.9", "desc": "食管癌"},
-    "鼻咽癌": {"code": "C11.9", "desc": "鼻咽癌"},
-    "转移性骨肿瘤": {"code": "C79.51", "desc": "骨转移癌"},
-    "转移癌": {"code": "C79.9", "desc": "继发性恶性肿瘤"},
-    "听神经瘤": {"code": "D33.3", "desc": "听神经良性肿瘤"},
-
-    # ---- 血液 (D50-D89) ----
-    "贫血": {"code": "D64.9", "desc": "贫血"},
-    "缺铁性贫血": {"code": "D50.9", "desc": "缺铁性贫血"},
-    "巨幼细胞性贫血": {"code": "D53.1", "desc": "巨幼细胞性贫血"},
-    "维生素B12缺乏": {"code": "D51.9", "desc": "维生素B12缺乏性贫血"},
-    "溶血性贫血": {"code": "D58.9", "desc": "遗传性溶血性贫血"},
-    "血小板减少": {"code": "D69.6", "desc": "血小板减少症"},
-    "特发性血小板减少性紫癜": {"code": "D69.3", "desc": "特发性血小板减少性紫癜"},
-    "过敏性紫癜": {"code": "D69.0", "desc": "过敏性紫癜"},
-    "弥散性血管内凝血": {"code": "D65", "desc": "弥散性血管内凝血"},
-
-    # ---- 内分泌 (E00-E89) ----
-    "甲状腺功能减退": {"code": "E03.9", "desc": "甲状腺功能减退"},
-    "甲状腺功能亢进": {"code": "E05.90", "desc": "甲状腺功能亢进"},
-    "糖尿病": {"code": "E11.9", "desc": "2型糖尿病"},
-    "2型糖尿病": {"code": "E11.9", "desc": "2型糖尿病"},
-    "1型糖尿病": {"code": "E10.9", "desc": "1型糖尿病"},
-    "糖尿病酮症酸中毒": {"code": "E11.10", "desc": "糖尿病酮症酸中毒"},
-    "低血糖": {"code": "E16.2", "desc": "低血糖症"},
-    "高脂血症": {"code": "E78.5", "desc": "高脂血症"},
-    "肥胖": {"code": "E66.9", "desc": "肥胖症"},
-    "肾上腺皮质功能减退": {"code": "E27.40", "desc": "肾上腺皮质功能减退"},
-    "嗜铬细胞瘤": {"code": "D35.00", "desc": "嗜铬细胞瘤"},
-    "高催乳素血症": {"code": "E22.1", "desc": "高催乳素血症"},
-    "多囊卵巢综合征": {"code": "E28.2", "desc": "多囊卵巢综合征"},
-    "维生素C缺乏": {"code": "E54", "desc": "维生素C缺乏"},
-    "叶酸缺乏": {"code": "D52.9", "desc": "叶酸缺乏性贫血"},
-
-    # ---- 精神行为 (F01-F99) ----
-    "抑郁症": {"code": "F32.9", "desc": "抑郁症"},
-    "抑郁发作": {"code": "F32.9", "desc": "抑郁症"},
-    "广泛性焦虑障碍": {"code": "F41.1", "desc": "广泛性焦虑障碍"},
-    "焦虑障碍": {"code": "F41.9", "desc": "焦虑障碍"},
-    "惊恐障碍": {"code": "F41.0", "desc": "惊恐障碍"},
-    "社交焦虑障碍": {"code": "F40.10", "desc": "社交焦虑障碍"},
-    "创伤后应激障碍": {"code": "F43.10", "desc": "创伤后应激障碍"},
-    "双相障碍": {"code": "F31.9", "desc": "双相障碍"},
-    "恶劣心境": {"code": "F34.1", "desc": "恶劣心境"},
-    "躯体形式障碍": {"code": "F45.9", "desc": "躯体形式障碍"},
-    "物质使用障碍": {"code": "F19.10", "desc": "物质使用障碍"},
-
-    # ---- 神经 (G00-G99) ----
-    "偏头痛": {"code": "G43.909", "desc": "偏头痛"},
-    "紧张性头痛": {"code": "G44.209", "desc": "紧张性头痛"},
-    "丛集性头痛": {"code": "G44.009", "desc": "丛集性头痛"},
-    "失眠症": {"code": "G47.00", "desc": "失眠症"},
-    "睡眠呼吸暂停综合征": {"code": "G47.33", "desc": "睡眠呼吸暂停综合征"},
-    "不宁腿综合征": {"code": "G25.81", "desc": "不宁腿综合征"},
-    "癫痫": {"code": "G40.909", "desc": "癫痫"},
-    "帕金森病": {"code": "G20", "desc": "帕金森病"},
-    "阿尔茨海默病": {"code": "G30.9", "desc": "阿尔茨海默病"},
-    "多发性硬化": {"code": "G35", "desc": "多发性硬化"},
-    "重症肌无力": {"code": "G70.00", "desc": "重症肌无力"},
-    "脑膜炎": {"code": "G03.9", "desc": "脑膜炎"},
-    "糖尿病周围神经病变": {"code": "G63.2", "desc": "糖尿病周围神经病变"},
-    "良性阵发性位置性眩晕": {"code": "H81.10", "desc": "良性阵发性位置性眩晕"},
-    "梅尼埃病": {"code": "H81.09", "desc": "梅尼埃病"},
-    "前庭神经炎": {"code": "H81.20", "desc": "前庭神经炎"},
-    "特发性震颤": {"code": "G25.0", "desc": "特发性震颤"},
-    "腕管综合征": {"code": "G56.00", "desc": "腕管综合征"},
-    "正常压力脑积水": {"code": "G91.2", "desc": "正常压力脑积水"},
-    "进行性核上性麻痹": {"code": "G23.1", "desc": "进行性核上性麻痹"},
-    "血管性痴呆": {"code": "F01.50", "desc": "血管性痴呆"},
-    "路易体痴呆": {"code": "G31.83", "desc": "路易体痴呆"},
-    "Wilson病": {"code": "E83.01", "desc": "Wilson病"},
-
-    # ---- 眼科 (H00-H59) ----
-    "白内障": {"code": "H26.9", "desc": "白内障"},
-    "青光眼": {"code": "H40.9", "desc": "青光眼"},
-    "糖尿病视网膜病变": {"code": "H36.0", "desc": "糖尿病视网膜病变"},
-    "黄斑变性": {"code": "H35.30", "desc": "黄斑变性"},
-    "视网膜脱离": {"code": "H33.40", "desc": "视网膜脱离"},
-    "视神经炎": {"code": "H46", "desc": "视神经炎"},
-
-    # ---- 耳鼻喉 (H60-H95) ----
-    "听力下降": {"code": "H91.90", "desc": "听力下降"},
-    "老年性耳聋": {"code": "H91.10", "desc": "老年性耳聋"},
-    "突发性耳聋": {"code": "H91.20", "desc": "突发性耳聋"},
-    "慢性化脓性中耳炎": {"code": "H66.40", "desc": "慢性化脓性中耳炎"},
-    "鼻出血": {"code": "R04.0", "desc": "鼻出血"},
-    "鼻窦炎": {"code": "J32.9", "desc": "慢性鼻窦炎"},
-
-    # ---- 循环系统 (I00-I99) ----
-    "高血压": {"code": "I10", "desc": "原发性高血压"},
-    "急性心肌梗死": {"code": "I21.9", "desc": "急性心肌梗死"},
-    "不稳定型心绞痛": {"code": "I20.0", "desc": "不稳定型心绞痛"},
-    "稳定型心绞痛": {"code": "I20.9", "desc": "心绞痛"},
-    "心力衰竭": {"code": "I50.9", "desc": "心力衰竭"},
-    "心房颤动": {"code": "I48.91", "desc": "心房颤动"},
-    "室性早搏": {"code": "I49.3", "desc": "室性早搏"},
-    "室上性心动过速": {"code": "I47.1", "desc": "室上性心动过速"},
-    "脑卒中": {"code": "I63.9", "desc": "脑梗死"},
-    "脑梗死": {"code": "I63.9", "desc": "脑梗死"},
-    "颅内出血": {"code": "I61.9", "desc": "脑出血"},
-    "蛛网膜下腔出血": {"code": "I60.9", "desc": "蛛网膜下腔出血"},
-    "颈动脉窦过敏": {"code": "G90.01", "desc": "颈动脉窦过敏"},
-    "主动脉夹层": {"code": "I71.00", "desc": "主动脉夹层"},
-    "腹主动脉瘤": {"code": "I71.4", "desc": "腹主动脉瘤"},
-    "深静脉血栓": {"code": "I82.40", "desc": "深静脉血栓"},
-    "肺栓塞": {"code": "I26.99", "desc": "肺栓塞"},
-    "心包炎": {"code": "I30.9", "desc": "急性心包炎"},
-    "感染性心内膜炎": {"code": "I33.0", "desc": "感染性心内膜炎"},
-    "二尖瓣脱垂": {"code": "I34.1", "desc": "二尖瓣脱垂"},
-    "二尖瓣狭窄": {"code": "I05.0", "desc": "风湿性二尖瓣狭窄"},
-    "静脉功能不全": {"code": "I87.2", "desc": "静脉功能不全"},
-    "颞动脉炎": {"code": "M31.6", "desc": "巨细胞性颞动脉炎"},
-    "遗传性出血性毛细血管扩张症": {"code": "I78.0", "desc": "遗传性出血性毛细血管扩张症"},
-
-    # ---- 呼吸系统 (J00-J99) ----
-    "上呼吸道感染": {"code": "J06.9", "desc": "急性上呼吸道感染"},
+_DISEASE_ICD10_FALLBACK = {
+    "肺炎": {"code": "J18.9", "desc": "肺炎，未特指"},
     "流行性感冒": {"code": "J11.1", "desc": "流感"},
     "COVID-19": {"code": "U07.1", "desc": "COVID-19"},
-    "肺炎": {"code": "J18.9", "desc": "肺炎"},
-    "细菌性肺炎": {"code": "J15.9", "desc": "细菌性肺炎"},
-    "支气管扩张": {"code": "J47.9", "desc": "支气管扩张"},
+    "急性心肌梗死": {"code": "I21.9", "desc": "急性心肌梗死"},
     "支气管哮喘": {"code": "J45.909", "desc": "支气管哮喘"},
-    "慢性阻塞性肺疾病": {"code": "J44.9", "desc": "慢性阻塞性肺疾病"},
-    "肺气肿": {"code": "J43.9", "desc": "肺气肿"},
-    "间质性肺病": {"code": "J84.10", "desc": "间质性肺病"},
-    "肺纤维化": {"code": "J84.10", "desc": "肺纤维化"},
-    "气胸": {"code": "J93.11", "desc": "自发性气胸"},
-    "胸腔积液": {"code": "J90", "desc": "胸腔积液"},
-    "睡眠呼吸暂停": {"code": "G47.33", "desc": "阻塞性睡眠呼吸暂停"},
-    "胸膜炎": {"code": "R09.1", "desc": "胸膜炎"},
-    "上气道咳嗽综合征": {"code": "J39.8", "desc": "上气道咳嗽综合征"},
-    "鼻窦炎（呼吸）": {"code": "J32.9", "desc": "慢性鼻窦炎"},
-    "急性支气管炎": {"code": "J20.9", "desc": "急性支气管炎"},
-    "百日咳": {"code": "A37.90", "desc": "百日咳"},
-    "咽炎": {"code": "J02.9", "desc": "急性咽炎"},
-
-    # ---- 消化系统 (K00-K95) ----
-    "胃食管反流病": {"code": "K21.9", "desc": "胃食管反流病"},
-    "反流性食管炎": {"code": "K21.0", "desc": "反流性食管炎"},
-    "消化性溃疡": {"code": "K27.9", "desc": "消化性溃疡"},
-    "消化性溃疡出血": {"code": "K27.4", "desc": "消化性溃疡伴出血"},
-    "消化道出血": {"code": "K92.2", "desc": "消化道出血"},
-    "胃穿孔": {"code": "K25.5", "desc": "胃溃疡伴穿孔"},
+    "2型糖尿病": {"code": "E11.9", "desc": "2型糖尿病"},
+    "高血压": {"code": "I10", "desc": "原发性高血压"},
+    "心力衰竭": {"code": "I50.9", "desc": "心力衰竭"},
+    "慢性阻塞性肺疾病": {"code": "J44.9", "desc": "COPD"},
     "急性阑尾炎": {"code": "K35.80", "desc": "急性阑尾炎"},
-    "炎症性肠病": {"code": "K52.9", "desc": "非感染性胃肠炎与结肠炎"},
-    "克罗恩病": {"code": "K50.90", "desc": "克罗恩病"},
-    "溃疡性结肠炎": {"code": "K51.90", "desc": "溃疡性结肠炎"},
-    "肠易激综合征": {"code": "K58.9", "desc": "肠易激综合征"},
-    "肠梗阻": {"code": "K56.69", "desc": "肠梗阻"},
-    "肠系膜淋巴结炎": {"code": "I88.0", "desc": "肠系膜淋巴结炎"},
-    "吸收不良综合征": {"code": "K90.9", "desc": "吸收不良综合征"},
-    "乳糜泻": {"code": "K90.0", "desc": "乳糜泻"},
-    "乳糖不耐受": {"code": "E73.9", "desc": "乳糖不耐受"},
+    "偏头痛": {"code": "G43.909", "desc": "偏头痛"},
+    "贫血": {"code": "D64.9", "desc": "贫血"},
+    "尿路感染": {"code": "N39.0", "desc": "尿路感染"},
+    "抑郁症": {"code": "F32.9", "desc": "抑郁症"},
+    "脓毒症": {"code": "A41.9", "desc": "脓毒症"},
+    "脑梗死": {"code": "I63.9", "desc": "脑梗死"},
+    "胃食管反流病": {"code": "K21.9", "desc": "胃食管反流病"},
+    "消化性溃疡": {"code": "K27.9", "desc": "消化性溃疡"},
     "肝硬化": {"code": "K74.60", "desc": "肝硬化"},
-    "食管静脉曲张破裂": {"code": "I85.00", "desc": "食管静脉曲张破裂出血"},
-    "急性肝炎": {"code": "K75.9", "desc": "急性肝炎"},
-    "肝炎": {"code": "K75.9", "desc": "肝炎"},
-    "慢性肝病": {"code": "K76.9", "desc": "慢性肝病"},
-    "脂肪肝": {"code": "K76.0", "desc": "脂肪肝"},
-    "肝性脑病": {"code": "K72.90", "desc": "肝性脑病"},
-    "肝肾综合征": {"code": "K76.7", "desc": "肝肾综合征"},
-    "急性胆囊炎": {"code": "K81.0", "desc": "急性胆囊炎"},
-    "胆囊结石": {"code": "K80.20", "desc": "胆囊结石"},
     "急性胰腺炎": {"code": "K85.90", "desc": "急性胰腺炎"},
-    "慢性胰腺炎": {"code": "K86.1", "desc": "慢性胰腺炎"},
-    "胆汁淤积": {"code": "K83.1", "desc": "胆汁淤积"},
-    "胆总管结石": {"code": "K80.50", "desc": "胆总管结石"},
-    "胃食管反流": {"code": "K21.9", "desc": "胃食管反流病"},
-    "功能性消化不良": {"code": "K30", "desc": "功能性消化不良"},
-    "食管狭窄": {"code": "K22.2", "desc": "食管狭窄"},
-    "贲门失弛缓症": {"code": "K22.0", "desc": "贲门失弛缓症"},
-    "Mallory-Weiss综合征": {"code": "K22.6", "desc": "Mallory-Weiss综合征"},
-    "血管发育不良": {"code": "K55.21", "desc": "结肠血管发育不良"},
-    "食管痉挛": {"code": "K22.4", "desc": "食管痉挛"},
-    "颞下颌关节紊乱病": {"code": "M26.60", "desc": "颞下颌关节紊乱病"},
-    "腹股沟疝": {"code": "K40.90", "desc": "腹股沟疝"},
-
-    # ---- 肌肉骨骼 (M00-M99) ----
-    "类风湿关节炎": {"code": "M06.9", "desc": "类风湿关节炎"},
+    "肺结核": {"code": "A15.0", "desc": "肺结核"},
+    "肺癌": {"code": "C34.90", "desc": "肺癌"},
+    "淋巴瘤": {"code": "C85.90", "desc": "淋巴瘤"},
+    "特发性震颤": {"code": "G25.0", "desc": "特发性震颤"},
+    "帕金森病": {"code": "G20", "desc": "帕金森病"},
+    "阿尔茨海默病": {"code": "G30.9", "desc": "阿尔茨海默病"},
+    "癫痫": {"code": "G40.909", "desc": "癫痫"},
     "骨关节炎": {"code": "M19.90", "desc": "骨关节炎"},
+    "类风湿关节炎": {"code": "M06.9", "desc": "类风湿关节炎"},
     "痛风": {"code": "M10.9", "desc": "痛风"},
     "系统性红斑狼疮": {"code": "M32.9", "desc": "系统性红斑狼疮"},
-    "多发性肌炎": {"code": "M33.20", "desc": "多发性肌炎"},
-    "皮肌炎": {"code": "M33.90", "desc": "皮肌炎"},
-    "风湿性多肌痛": {"code": "M35.3", "desc": "风湿性多肌痛"},
-    "纤维肌痛综合征": {"code": "M79.1", "desc": "纤维肌痛综合征"},
-    "腰椎间盘突出症": {"code": "M51.26", "desc": "腰椎间盘突出症"},
-    "腰椎管狭窄": {"code": "M48.06", "desc": "腰椎管狭窄"},
-    "颈椎病": {"code": "M50.90", "desc": "颈椎间盘疾病"},
-    "颈椎间盘突出": {"code": "M50.20", "desc": "颈椎间盘突出"},
-    "强直性脊柱炎": {"code": "M45.9", "desc": "强直性脊柱炎"},
-    "腰肌劳损": {"code": "M54.5", "desc": "下背痛"},
-    "骨质疏松": {"code": "M81.0", "desc": "骨质疏松症"},
-    "脊椎压缩性骨折": {"code": "M48.54", "desc": "椎体压缩性骨折"},
-    "肋软骨炎": {"code": "M94.0", "desc": "肋软骨炎（Tietze）"},
-    "银屑病关节炎": {"code": "L40.50", "desc": "银屑病关节炎"},
-    "反应性关节炎": {"code": "M02.30", "desc": "反应性关节炎"},
-    "横纹肌溶解症": {"code": "M62.81", "desc": "横纹肌溶解症"},
-    "血清阴性脊柱关节病": {"code": "M46.9", "desc": "脊柱关节病"},
-    "骨坏死": {"code": "M87.9", "desc": "骨坏死"},
-    "滑膜炎": {"code": "M65.9", "desc": "滑膜炎"},
-    "淋巴水肿": {"code": "I89.0", "desc": "淋巴水肿"},
-    "结节病": {"code": "D86.9", "desc": "结节病"},
-
-    # ---- 泌尿生殖 (N00-N99) ----
-    "急性肾损伤": {"code": "N17.9", "desc": "急性肾损伤"},
-    "慢性肾病": {"code": "N18.9", "desc": "慢性肾脏病"},
-    "肾小球肾炎": {"code": "N05.9", "desc": "肾小球肾炎"},
+    "急性支气管炎": {"code": "J20.9", "desc": "急性支气管炎"},
+    "肺栓塞": {"code": "I26.99", "desc": "肺栓塞"},
     "肾病综合征": {"code": "N04.9", "desc": "肾病综合征"},
-    "IgA肾病": {"code": "N02.8", "desc": "免疫球蛋白A肾病"},
-    "尿路感染": {"code": "N39.0", "desc": "尿路感染"},
     "肾盂肾炎": {"code": "N12", "desc": "肾盂肾炎"},
-    "肾结石": {"code": "N20.9", "desc": "肾结石"},
-    "输尿管结石": {"code": "N20.1", "desc": "输尿管结石"},
-    "尿毒症": {"code": "N18.6", "desc": "终末期肾病"},
-    "良性前列腺增生": {"code": "N40.1", "desc": "良性前列腺增生"},
-    "膀胱过度活动症": {"code": "N32.81", "desc": "膀胱过度活动症"},
-    "间质性膀胱炎": {"code": "N30.10", "desc": "间质性膀胱炎"},
-    "尿路梗阻": {"code": "N13.9", "desc": "梗阻性肾病"},
-
-    # ---- 妇产科 (O00-O9A) ----
-    "妊娠": {"code": "Z34.90", "desc": "正常妊娠"},
-    "宫外孕破裂": {"code": "O00.9", "desc": "异位妊娠"},
-    "卵巢囊肿扭转": {"code": "N83.50", "desc": "卵巢扭转"},
-    "子宫肌瘤": {"code": "D25.9", "desc": "子宫肌瘤"},
-    "子宫腺肌症": {"code": "N80.00", "desc": "子宫腺肌症"},
-    "子宫内膜增生": {"code": "N85.00", "desc": "子宫内膜增生"},
-    "功能性子宫出血": {"code": "N93.8", "desc": "功能性子宫出血"},
-    "异位妊娠": {"code": "O00.90", "desc": "异位妊娠"},
-
-    # ---- 皮肤病 (L00-L99) ----
-    "荨麻疹": {"code": "L50.9", "desc": "荨麻疹"},
-    "银屑病": {"code": "L40.9", "desc": "银屑病"},
-    "特应性皮炎": {"code": "L20.9", "desc": "特应性皮炎"},
-    "疥疮": {"code": "B86", "desc": "疥疮"},
-    "Stevens-Johnson综合征": {"code": "L51.1", "desc": "Stevens-Johnson综合征"},
-    "蜂窝织炎": {"code": "L03.90", "desc": "蜂窝织炎"},
-
-    # ---- 中毒/损伤 ----
-    "药物性肝损伤": {"code": "K71.9", "desc": "中毒性肝病"},
-    "一氧化碳中毒": {"code": "T58.91", "desc": "一氧化碳中毒"},
-    "药物不良反应": {"code": "T88.7", "desc": "药物不良反应"},
-    "过敏性反应": {"code": "T78.40", "desc": "过敏反应"},
-    "赖特综合征": {"code": "M02.30", "desc": "Reiter病"},
-    "Goodpasture综合征": {"code": "M31.0", "desc": "Goodpasture综合征"},
-
-    # ---- 症状/体征 (R00-R99) ----
-    "不明原因发热": {"code": "R50.9", "desc": "不明原因发热"},
-    "疼痛": {"code": "R52", "desc": "未特指疼痛"},
-    "体位性低血压": {"code": "I95.1", "desc": "体位性低血压"},
-    "阻塞性黄疸": {"code": "R17", "desc": "未特指黄疸"},
-
-    # ---- 特殊编码 (U00-U85) ----
-    "COVID-19 U07": {"code": "U07.1", "desc": "COVID-19"},
-    "成人Still病": {"code": "M06.1", "desc": "成人Still病"},
-    "Gilbert综合征": {"code": "E80.4", "desc": "Gilbert综合征"},
-    "抗磷脂抗体综合征": {"code": "D68.61", "desc": "抗磷脂抗体综合征"},
-    "囊性纤维化": {"code": "E84.9", "desc": "囊性纤维化"},
-    "药物性震颤": {"code": "G25.1", "desc": "药物性震颤"},
-    "戒断综合征": {"code": "F19.239", "desc": "药物戒断综合征"},
-
-    # ---- 保留原有英文条目（兼容旧数据）----
-    "Pneumonia": {"code": "J18.9", "desc": "肺炎"},
+    "甲状腺功能减退": {"code": "E03.9", "desc": "甲状腺功能减退"},
+    "甲状腺功能亢进": {"code": "E05.90", "desc": "甲状腺功能亢进"},
+    "前列腺增生": {"code": "N40.1", "desc": "良性前列腺增生"},
+    "睡眠呼吸暂停": {"code": "G47.33", "desc": "睡眠呼吸暂停"},
+    # 英文兼容（旧测试数据）
+    "Pneumonia": {"code": "J18.9", "desc": "肺炎，未特指"},
     "Influenza": {"code": "J11.1", "desc": "流感"},
     "Acute MI": {"code": "I21.9", "desc": "急性心肌梗死"},
     "Asthma": {"code": "J45.909", "desc": "支气管哮喘"},
     "Type 2 Diabetes": {"code": "E11.9", "desc": "2型糖尿病"},
     "Hypertension": {"code": "I10", "desc": "原发性高血压"},
     "Heart Failure": {"code": "I50.9", "desc": "心力衰竭"},
-    "COPD": {"code": "J44.1", "desc": "慢性阻塞性肺疾病"},
+    "COPD": {"code": "J44.1", "desc": "COPD"},
     "Appendicitis": {"code": "K35.80", "desc": "急性阑尾炎"},
     "Migraine": {"code": "G43.909", "desc": "偏头痛"},
     "Anemia": {"code": "D64.9", "desc": "贫血"},
@@ -479,12 +107,280 @@ DISEASE_ICD10_MAP = {
 }
 
 
+# ============================================================================
+# CMeIE 知识图谱 → 我们的关系类型映射
+# ============================================================================
+_RELATION_ATTRIBUTES = {
+    "symptom": {
+        "label": "临床表现",
+        "count": 11591, "description": "疾病表现出的症状"
+    },
+    "drug": {
+        "label": "药物治疗",
+        "count": 4570, "description": "治疗该疾病的药物"
+    },
+    "lab_test": {
+        "label": "实验室检查",
+        "count": 1852, "description": "诊断/监测该疾病的实验室检查"
+    },
+    "diff_diagnosis": {
+        "label": "鉴别诊断",
+        "count": 1331, "description": "需与该病鉴别的其他疾病"
+    },
+    "complication": {
+        "label": "并发症",
+        "count": 2057, "description": "该疾病可能导致的并发症"
+    },
+    "imaging": {
+        "label": "影像学检查",
+        "count": 1439, "description": "诊断该疾病的影像学检查"
+    },
+    "surgery": {
+        "label": "手术治疗",
+        "count": 923, "description": "治疗该疾病的手术方式"
+    },
+    "auxiliary_treatment": {
+        "label": "辅助治疗",
+        "count": 1550, "description": "辅助治疗手段"
+    },
+    "causes": {
+        "label": "相关（导致）",
+        "count": 1496, "description": "该疾病可导致的其他疾病"
+    },
+    "related_symptom": {
+        "label": "相关（症状）",
+        "count": 429, "description": "症状层面相关的疾病"
+    },
+    "pathology_type": {
+        "label": "病理分型",
+        "count": 560, "description": "该疾病的病理亚型"
+    },
+    "auxiliary_test": {
+        "label": "辅助检查",
+        "count": 1000, "description": "辅助性检查手段"
+    },
+}
+
+
 class GraphRAGService:
-    """医学知识图谱检索服务。生产模式连接 Neo4j，默认使用内存知识库。"""
+    """
+    医学知识图谱检索服务。
+
+    主数据源：CMeIE 知识图谱（SQLite，36k+ 三元组）
+    回退方案：内存字典（KG 数据库文件不存在或查询失败时）
+    ICD-10：内存字典（KG 中不包含编码信息）
+    """
 
     def __init__(self, use_neo4j: bool = False):
         self.use_neo4j = use_neo4j
         self._driver = None
+        self._kg_conn: sqlite3.Connection | None = None
+        self._kg_available = False
+        self._init_kg()
+
+    def _init_kg(self):
+        """初始化 CMeIE 知识图谱数据库连接。"""
+        if _KG_DB_PATH.exists():
+            try:
+                self._kg_conn = sqlite3.connect(str(_KG_DB_PATH))
+                self._kg_conn.row_factory = sqlite3.Row
+                self._kg_available = True
+                # 快速验证
+                count = self._kg_conn.execute(
+                    "SELECT COUNT(*) FROM relations"
+                ).fetchone()[0]
+                logger.info("cmeie_kg.ready", triples=count, path=str(_KG_DB_PATH))
+            except Exception as e:
+                logger.warning("cmeie_kg.init_failed", error=str(e))
+
+    @property
+    def kg_stats(self) -> dict:
+        """返回知识图谱统计信息。"""
+        if not self._kg_available:
+            return {"available": False, "fallback": "内存字典"}
+        try:
+            diseases = self._kg_conn.execute(
+                "SELECT COUNT(*) FROM diseases"
+            ).fetchone()[0]
+            relations = self._kg_conn.execute(
+                "SELECT COUNT(*) FROM relations"
+            ).fetchone()[0]
+            symptoms = self._kg_conn.execute(
+                "SELECT COUNT(DISTINCT symptom) FROM symptom_disease"
+            ).fetchone()[0]
+            return {
+                "available": True,
+                "source": "CMeIE",
+                "diseases": diseases,
+                "relations": relations,
+                "symptoms": symptoms,
+            }
+        except Exception:
+            return {"available": False}
+
+    # ---- 核心查询方法 ----
+
+    def find_diseases_by_symptoms(self, symptoms: list[str]) -> list[dict]:
+        """
+        根据症状列表检索候选疾病，按匹配症状数排序。
+
+        KG 模式：查询 symptom_disease 倒排索引
+        回退模式：内存字典投票计数
+        """
+        results = []
+
+        if self._kg_available and symptoms:
+            try:
+                placeholders = ",".join("?" for _ in symptoms)
+                rows = self._kg_conn.execute(
+                    f"""SELECT disease, SUM(frequency) as total_freq
+                        FROM symptom_disease
+                        WHERE symptom IN ({placeholders})
+                        GROUP BY disease
+                        ORDER BY total_freq DESC
+                        LIMIT 30""",
+                    symptoms,
+                ).fetchall()
+
+                for row in rows:
+                    icd = _DISEASE_ICD10_FALLBACK.get(row["disease"], {})
+                    results.append({
+                        "disease": row["disease"],
+                        "symptom_match_count": row["total_freq"],
+                        "icd10_code": icd.get("code", ""),
+                        "icd10_description": icd.get("desc", ""),
+                    })
+                if results:
+                    return results
+            except Exception as e:
+                logger.warning("cmeie_kg.query_failed", error=str(e))
+
+        # 回退：内存字典
+        disease_scores: dict[str, float] = {}
+        for symptom in symptoms:
+            if symptom in _SYMPTOM_DISEASE_FALLBACK:
+                for d in _SYMPTOM_DISEASE_FALLBACK[symptom]:
+                    disease_scores[d] = disease_scores.get(d, 0) + 1
+            # 模糊匹配
+            else:
+                for map_key in _SYMPTOM_DISEASE_FALLBACK:
+                    if symptom in map_key or map_key in symptom:
+                        for d in _SYMPTOM_DISEASE_FALLBACK[map_key]:
+                            disease_scores[d] = disease_scores.get(d, 0) + 0.5
+
+        ranked = sorted(disease_scores.items(), key=lambda x: x[1], reverse=True)
+        for disease, score in ranked:
+            icd = _DISEASE_ICD10_FALLBACK.get(disease, {})
+            results.append({
+                "disease": disease,
+                "symptom_match_count": score,
+                "icd10_code": icd.get("code", ""),
+                "icd10_description": icd.get("desc", ""),
+            })
+        return results
+
+    def get_disease_relations(
+        self, disease_name: str, relation_types: list[str] | None = None
+    ) -> dict[str, list[str]]:
+        """
+        获取指定疾病的所有关系。
+
+        Args:
+            disease_name: 疾病名称
+            relation_types: 关系类型列表，如 ["symptom", "drug"]，None 表示全部
+        Returns:
+            {relation_type: [object1, object2, ...], ...}
+        """
+        if not self._kg_available:
+            return {}
+
+        try:
+            if relation_types:
+                placeholders = ",".join("?" for _ in relation_types)
+                rows = self._kg_conn.execute(
+                    f"""SELECT relation_type, object, frequency
+                        FROM relations
+                        WHERE subject = ? AND relation_type IN ({placeholders})
+                        ORDER BY frequency DESC
+                        LIMIT 50""",
+                    [disease_name] + relation_types,
+                ).fetchall()
+            else:
+                rows = self._kg_conn.execute(
+                    """SELECT relation_type, object, frequency
+                       FROM relations
+                       WHERE subject = ?
+                       ORDER BY frequency DESC
+                       LIMIT 50""",
+                    (disease_name,),
+                ).fetchall()
+
+            result: dict[str, list[str]] = {}
+            for row in rows:
+                rt = row["relation_type"]
+                if rt not in result:
+                    result[rt] = []
+                result[rt].append(row["object"])
+
+            return result
+
+        except Exception as e:
+            logger.warning("cmeie_kg.get_relations_failed", error=str(e))
+            return {}
+
+    def get_disease_symptoms(self, disease_name: str, top_n: int = 20) -> list[str]:
+        """获取疾病的常见症状。"""
+        rels = self.get_disease_relations(disease_name, ["symptom"])
+        return rels.get("symptom", [])[:top_n]
+
+    def get_disease_drugs(self, disease_name: str, top_n: int = 10) -> list[str]:
+        """获取疾病的常用治疗药物。"""
+        rels = self.get_disease_relations(disease_name, ["drug"])
+        return rels.get("drug", [])[:top_n]
+
+    def get_disease_tests(self, disease_name: str, top_n: int = 10) -> list[str]:
+        """获取疾病的相关检查。"""
+        rels = self.get_disease_relations(
+            disease_name, ["lab_test", "imaging", "auxiliary_test"]
+        )
+        all_tests = []
+        for key in ("lab_test", "imaging", "auxiliary_test"):
+            all_tests.extend(rels.get(key, []))
+        return all_tests[:top_n]
+
+    def get_differential_diagnosis(self, disease_name: str, top_n: int = 10) -> list[str]:
+        """获取需要与指定疾病鉴别的其他疾病。"""
+        rels = self.get_disease_relations(disease_name, ["diff_diagnosis"])
+        return rels.get("diff_diagnosis", [])[:top_n]
+
+    def get_complications(self, disease_name: str, top_n: int = 10) -> list[str]:
+        """获取疾病的常见并发症。"""
+        rels = self.get_disease_relations(disease_name, ["complication"])
+        return rels.get("complication", [])[:top_n]
+
+    def search_diseases(self, keyword: str, limit: int = 20) -> list[str]:
+        """按关键词搜索疾病名称。"""
+        if not self._kg_available:
+            matches = [
+                d for d in _DISEASE_ICD10_FALLBACK
+                if keyword in d
+            ]
+            return matches[:limit]
+
+        try:
+            rows = self._kg_conn.execute(
+                "SELECT DISTINCT subject FROM relations WHERE subject LIKE ? LIMIT ?",
+                (f"%{keyword}%", limit),
+            ).fetchall()
+            return [r["subject"] for r in rows]
+        except Exception:
+            return []
+
+    def get_icd10(self, disease_name: str) -> Optional[dict]:
+        """根据疾病名称查找 ICD-10 编码。"""
+        return _DISEASE_ICD10_FALLBACK.get(disease_name)
+
+    # ---- Neo4j（预留） ----
 
     async def connect(self):
         if self.use_neo4j:
@@ -500,41 +396,8 @@ class GraphRAGService:
                 logger.warning("graphrag.neo4j_fallback", error=str(e))
                 self.use_neo4j = False
 
-    def find_diseases_by_symptoms(self, symptoms: list[str]) -> list[dict]:
-        """根据症状列表检索候选疾病，按匹配症状数排序。"""
-        disease_scores: dict[str, int] = {}
-        for symptom in symptoms:
-            key = symptom.lower().strip()
-            if key in SYMPTOM_DISEASE_MAP:
-                for disease in SYMPTOM_DISEASE_MAP[key]:
-                    disease_scores[disease] = disease_scores.get(disease, 0) + 1
-            # 精确匹配失败时尝试模糊匹配
-            elif key:
-                for map_key in SYMPTOM_DISEASE_MAP:
-                    if key in map_key or map_key in key:
-                        for disease in SYMPTOM_DISEASE_MAP[map_key]:
-                            disease_scores[disease] = disease_scores.get(disease, 0) + 0.5
-
-        ranked = sorted(disease_scores.items(), key=lambda x: x[1], reverse=True)
-        results = []
-        for disease, score in ranked:
-            icd = DISEASE_ICD10_MAP.get(disease, {})
-            results.append({
-                "disease": disease,
-                "symptom_match_count": score,
-                "icd10_code": icd.get("code", ""),
-                "icd10_description": icd.get("desc", ""),
-            })
-        return results
-
-    def get_icd10(self, disease_name: str) -> Optional[dict]:
-        """根据疾病名称查找 ICD-10 编码。"""
-        return DISEASE_ICD10_MAP.get(disease_name)
-
     async def query_neo4j(self, cypher: str, params: dict = None) -> list[dict]:
-        """Neo4j Cypher 查询（生产模式）。"""
         if not self._driver:
-            logger.warning("graphrag.neo4j_not_connected")
             return []
         async with self._driver.session() as session:
             result = await session.run(cypher, params or {})

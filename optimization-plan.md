@@ -12,11 +12,12 @@
 | P1-1 | LLM 单例 + Prompt Caching | P1 | ✅ 已完成 | 2026-04-28 |
 | P1-2 | SSE 流式输出 | P1 | ✅ 已完成 | 2026-04-28 |
 | P1-3 | Agent/Pipeline 测试 | P1 | ✅ 已完成 | 2026-04-28 |
-| P2-2 | 知识库扩展（ICD-10/DDI/GraphRAG） | P2 | ✅ 已完成 | 2026-04-28 |
+| P2-2 | 知识库扩展（ICD-10/DDI/症状-疾病知识库） | P2 | ✅ 已完成 | 2026-04-28 |
 | P2-4 | HIPAA → 中国数据合规审计 | P2 | ✅ 已完成 | 2026-04-28 |
 | P2-1 | 持久化 Checkpointer | P2 | ✅ 已完成 | 2026-04-28 |
 | P2-3 | 输入安全防护 | P2 | ✅ 已完成 | 2026-04-28 |
 | — | **React 前端界面** | — | ✅ 已完成 | 2026-04-28 |
+| P2-5 | CMeIE 医学知识图谱 | P2 | ✅ 已完成 | 2026-04-29 |
 
 ---
 
@@ -51,7 +52,7 @@ POST /api/v1/clinical/analyze
 - 4 个 LLM Agent 不调用已有的 Service 层，全靠幻觉
 - 手写 json.loads() 解析，无 schema 校验
 - 无循环上限、无持久化、无流式输出
-- ICD-10 30 条 / DDI 10 条 / GraphRAG 11 症状
+- ICD-10 30 条 / DDI 10 条 / 症状-疾病知识库 11 症状
 - HIPAA 合规检查全部硬编码 True
 - 0 个 Agent/Pipeline 测试
 ```
@@ -70,7 +71,7 @@ POST /api/v1/clinical/analyze         POST /api/v1/clinical/analyze/stream
    Intake ──(structured_output→IntakeOutput)──▶ patient_info
         │
         ▼
- Diagnosis ──(GraphRAG检索→LLM推理)──▶ diagnosis + needs_more_info
+ Diagnosis ──(知识库检索→LLM推理)──▶ diagnosis + needs_more_info
         │                                      │
         │   回退循环（上限3次）                  │
         │                                      │
@@ -192,8 +193,8 @@ patient_dict = output.model_dump(mode="json")
 | **ICD-10 编码** | 30 条硬编码 dict | CMS 2026 XML → SQLite，36,343 条可计费编码，LIKE 模糊搜索含相关性排序 |
 | **DDI 数据库** | 10 条英文条目 | 85+ 条，全部中文药物名，覆盖抗生素/心血管/降糖/精神科/抗凝/NSAID 6 大类 |
 | **药物类别映射** | 14 个英文映射 | 108 个中英文药物名→类别标识符映射 |
-| **GraphRAG 症状** | 11 种英文症状 | 50+ 种中文症状，每症状对应 5-15 个候选疾病，支持模糊匹配 |
-| **GraphRAG 疾病** | 15 条英文疾病→编码 | 200+ 条中英文疾病→ICD-10 编码，覆盖 22 个 ICD-10 章节 |
+| **症状-疾病知识库** | 11 种英文症状 | 50+ 种中文症状，每症状对应 5-15 个候选疾病，支持模糊匹配 |
+| **疾病-ICD10映射** | 15 条英文疾病→编码 | 200+ 条中英文疾病→ICD-10 编码，覆盖 22 个 ICD-10 章节 |
 | **过敏检查** | 简单字符串匹配 | 青霉素交叉反应（头孢类~10%）、磺胺过敏识别 |
 
 **改动文件**：`icd10_service.py`（SQLite）、`drug_interaction.py`（200+条）、`graphrag_service.py`（50+/200+）、新增 `scripts/import_icd10.py`
